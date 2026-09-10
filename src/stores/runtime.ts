@@ -1,0 +1,300 @@
+import { create } from "zustand";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { toast } from "sonner";
+import type { Project, RunStatus } from "@/types";
+
+/** 单条日志（stdout/stderr 合并流，保留来源用于着色） */
+export interface LogLine {
+  stream: "stdout" | "stderr";
+  line: string;
+}
+
+/** 每个项目的运行时状态（内存，不持久化） */
+export interface ProjectRuntime {
+  status: RunStatus;
+  pid?: number;
+  url?: string;
+  startedAt?: number;
+  exitCode?: number;
+}
+
+/** 日志环形缓冲上限（PRD FR-4） */
+const MAX_LOG_LINES = 2000;
+
+/**
+ * 从日志行解析本地地址（PRD FR-5）。
+ * 两种形态：
+ * 1. 完整 URL：Vite `Local:   http://localhost:5173/`、webpack `App running at: ...`、
+ *    Next `- Local:  http://localhost:3000`
+ * 2. 纯端口：Vite7 精简输出 `Port: 5173`、`listening on 3000` 等（无 http:// 前缀）
+ */
+const URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):(\d{2,5})/;
+const PORT_RE = /(?:port|端口)\D{0,8}?(\d{2,5})\b|listening on (\d{2,5})/i;
+
+/** 解析一行日志，返回端口号（无则 null） */
+function parsePort(line: string): number | null {
+  const m1 = line.match(URL_RE);
+  if (m1) return Number(m1[1]);
+  const m2 = line.match(PORT_RE);
+  if (m2) return Number(m2[1] ?? m2[2]);
+  return null;
+}
+
+/** 已确认过的地址就不再重复探测（同一端口只探一次） */
+const confirmedUrls = new Set<string>();
+
+/** 进程退出/手动停止后调用：下次启动时重新解析端口 */
+function resetConfirmedUrls(projectId: string) {
+  for (const key of confirmedUrls) {
+    if (key.startsWith(`${projectId}:`)) confirmedUrls.delete(key);
+  }
+}
+
+/** TCP 连通即认为服务就绪（前端 fetch 会受 CORS 限制，探 TCP 不受影响）。
+ * 服务可能「打印地址」早于「真正监听」，失败后重试几次而不是一次放弃。 */
+async function probePort(port: number, attempts = 3): Promise<boolean> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await invoke("probe_port", { port, timeoutMs: 1500 });
+      return true;
+    } catch {
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  return false;
+}
+
+/** stop/restart 用：等 process-exit 事件到达再继续（超时兜底） */
+const exitWaiters = new Map<string, () => void>();
+
+function waitForExit(projectId: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      exitWaiters.delete(projectId);
+      resolve(false); // 超时：进程没退出，调用方据此处理
+    }, timeoutMs);
+    exitWaiters.set(projectId, () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+interface RuntimeStore {
+  runtimes: Record<string, ProjectRuntime>;
+  logs: Record<string, LogLine[]>;
+  /** 本机局域网 IP（展示用；null = 未知，回退 localhost） */
+  lanIp: string | null;
+  /** error 时自动弹日志抽屉（PRD 4.3），App 层消费后清空 */
+  pendingErrorProjectId: string | null;
+
+  /** 挂一次全局事件监听（App 挂载时调用） */
+  initListeners: () => Promise<void>;
+  /** 从 Rust pid 表同步运行状态（页面重载后找回真实状态） */
+  syncFromBackend: () => Promise<void>;
+  loadLanIp: () => Promise<void>;
+  clearLogs: (projectId: string) => void;
+  start: (project: Project) => Promise<void>;
+  stop: (project: Project) => Promise<void>;
+  restart: (project: Project) => Promise<void>;
+}
+
+export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
+  runtimes: {},
+  logs: {},
+  lanIp: null,
+  pendingErrorProjectId: null,
+
+  initListeners: async () => {
+    // 孤儿进程清理结果提示（Rust setup 阶段发的事件，可能早于本监听注册——
+    // 事件监听慢于 setup 只能尽力而为，清理本身在 Rust 侧已完成，这里只是提示）
+    await listen<number>("orphans-cleaned", (ev) => {
+      toast.info(`检测到上次异常退出，已清理 ${ev.payload} 个残留进程`);
+    });
+
+    await listen<{ projectId: string; stream: "stdout" | "stderr"; line: string }>(
+      "log-line",
+      (ev) => {
+        const { projectId, stream, line } = ev.payload;
+        set((s) => {
+          const buf = [...(s.logs[projectId] ?? []), { stream, line }];
+          if (buf.length > MAX_LOG_LINES) buf.splice(0, buf.length - MAX_LOG_LINES);
+          return { logs: { ...s.logs, [projectId]: buf } };
+        });
+
+        // 端口解析：starting/running 期间匹配到端口就探测并更新（PRD FR-5）
+        const rt = get().runtimes[projectId];
+        if (rt && (rt.status === "starting" || rt.status === "running")) {
+          const port = parsePort(line);
+          if (port !== null) {
+            const key = `${projectId}:${port}`;
+            if (!confirmedUrls.has(key)) {
+              confirmedUrls.add(key);
+              probePort(port).then((ok) => {
+                if (!ok) return;
+                set((s) => {
+                  const cur = s.runtimes[projectId];
+                  if (!cur || cur.status === "stopped") return {};
+                  return {
+                    runtimes: {
+                      ...s.runtimes,
+                      [projectId]: {
+                        ...cur,
+                        url: `http://localhost:${port}`,
+                        status: "running",
+                      },
+                    },
+                  };
+                });
+              });
+            }
+          }
+        }
+      },
+    );
+
+    await listen<{ projectId: string; code: number | null }>(
+      "process-exit",
+      (ev) => {
+        const { projectId, code } = ev.payload;
+        // 有 waiter = 我们主动 stop 的，属正常退出；否则是崩溃/被外部杀死 → error
+        const waiter = exitWaiters.get(projectId);
+        const intentional = waiter !== undefined;
+        if (waiter) {
+          exitWaiters.delete(projectId);
+          waiter();
+        }
+        resetConfirmedUrls(projectId);
+        set((s) => ({
+          runtimes: {
+            ...s.runtimes,
+            [projectId]: {
+              status: intentional ? "stopped" : "error",
+              exitCode: code ?? undefined,
+            },
+          },
+          // 非主动退出（崩溃/被外部杀）→ 自动弹日志抽屉（PRD 4.3 / 验收 4）
+          pendingErrorProjectId: intentional ? s.pendingErrorProjectId : projectId,
+        }));
+      },
+    );
+  },
+
+  syncFromBackend: async () => {
+    try {
+      const running = await invoke<Record<string, number>>("get_running");
+      set((s) => {
+        const runtimes = { ...s.runtimes };
+        // Rust 说在跑 → 标 running；Rust 说没跑但前端显示 running → 拉回 stopped
+        for (const [id, pid] of Object.entries(running)) {
+          const cur = runtimes[id];
+          if (!cur || cur.status === "stopped" || cur.status === "error") {
+            runtimes[id] = { status: "running", pid, startedAt: cur?.startedAt };
+          }
+        }
+        for (const [id, rt] of Object.entries(runtimes)) {
+          if (rt.status === "running" && !(id in running)) {
+            runtimes[id] = { status: "stopped" };
+          }
+        }
+        return { runtimes };
+      });
+    } catch {
+      // 命令不可用（异常场景）：保持现状
+    }
+  },
+
+  loadLanIp: async () => {
+    try {
+      const ip = await invoke<string>("get_lan_ip");
+      set({ lanIp: ip });
+    } catch {
+      // 无网络/未知环境：保持 null，地址列回退 localhost
+    }
+  },
+
+  clearLogs: (projectId) => set((s) => ({ logs: { ...s.logs, [projectId]: [] } })),
+
+  start: async (project) => {
+    const rt = get().runtimes[project.id];
+    if (rt && (rt.status === "running" || rt.status === "starting")) return;
+
+    // 端口冲突预警（PRD FR-5 P1）：配置了手动端口且已被占用 → 警告但不阻止
+    // （脚手架可能自动换端口，实际以日志解析为准）
+    if (project.manualPort) {
+      try {
+        await invoke("probe_port", { port: project.manualPort, timeoutMs: 800 });
+        toast.warning(
+          `端口 ${project.manualPort} 已被占用，「${project.name}」可能启动失败或自动换端口`,
+        );
+      } catch {
+        // 连不通 = 端口空闲，符合预期
+      }
+    }
+
+    set((s) => ({
+      runtimes: {
+        ...s.runtimes,
+        [project.id]: { status: "starting", startedAt: Date.now() },
+      },
+    }));
+    try {
+      const pid = await invoke<number>("start_project", { project });
+      set((s) => {
+        const cur = s.runtimes[project.id];
+        // 脚本报错时进程可能瞬间退出、exit 事件先于 invoke 返回到达，别覆盖 error
+        if (cur && cur.status !== "starting") return {};
+        return {
+          runtimes: {
+            ...s.runtimes,
+            [project.id]: { status: "running", pid, startedAt: Date.now() },
+          },
+        };
+      });
+    } catch (e) {
+      // 前端状态与 Rust pid 表失同步（页面重载后常见）：同步真实状态再展示
+      await get().syncFromBackend();
+      const stillRunning =
+        get().runtimes[project.id]?.status === "running";
+      set((s) => ({
+        runtimes: {
+          ...s.runtimes,
+          [project.id]: stillRunning
+            ? s.runtimes[project.id]
+            : { status: "stopped" },
+        },
+      }));
+      if (!stillRunning) {
+        toast.error(`启动「${project.name}」失败: ${e}`);
+      }
+    }
+  },
+
+  stop: async (project) => {
+    const rt = get().runtimes[project.id];
+    if (!rt || rt.status !== "running") return;
+    try {
+      // 先注册 exit waiter 再下发 kill：taskkill /F 是毫秒级，
+      // exit 事件可能抢在 invoke 返回前到达，先挂 waiter 才不会被误判为崩溃
+      const exited = waitForExit(project.id, 8000);
+      await invoke("stop_project", { projectId: project.id });
+      const ok = await exited;
+      const cur = get().runtimes[project.id];
+      if (ok || cur?.status === "running") {
+        // 正常等到退出事件，或超时兜底（进程卡死也按已停处理，重启路径才能走下去）
+        set((s) => ({
+          runtimes: { ...s.runtimes, [project.id]: { status: "stopped" } },
+        }));
+      }
+    } catch (e) {
+      toast.error(`停止「${project.name}」失败: ${e}`);
+    }
+  },
+
+  // 先完整走停止、确认退出后再启动（PRD FR-3：不并行发两份命令）
+  restart: async (project) => {
+    await get().stop(project);
+    await get().start(project);
+  },
+}));
