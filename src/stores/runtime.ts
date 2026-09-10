@@ -68,6 +68,13 @@ async function probePort(port: number, attempts = 3): Promise<boolean> {
 /** stop/restart 用：等 process-exit 事件到达再继续（超时兜底） */
 const exitWaiters = new Map<string, () => void>();
 
+/**
+ * 主动停止的宽限标记（时间戳）。stop 超时兜底（进程卡死）后 waiters 已被清掉，
+ * 迟到的 process-exit 事件会误判为崩溃弹日志抽屉——在宽限期内视为主动停止。
+ */
+const intentionalStops = new Map<string, number>();
+const INTENTIONAL_GRACE_MS = 15_000;
+
 function waitForExit(projectId: string, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -80,6 +87,10 @@ function waitForExit(projectId: string, timeoutMs: number): Promise<boolean> {
     });
   });
 }
+
+/** initListeners 幂等保护：React StrictMode(dev) 下 effect 双执行会重复挂监听，
+ * 同一个 process-exit 被处理两次，第二次因 waiter 已被消费而误判为崩溃弹日志 */
+let listenersReady = false;
 
 interface RuntimeStore {
   runtimes: Record<string, ProjectRuntime>;
@@ -107,6 +118,9 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
   pendingErrorProjectId: null,
 
   initListeners: async () => {
+    if (listenersReady) return;
+    listenersReady = true;
+
     // 孤儿进程清理结果提示（Rust setup 阶段发的事件，可能早于本监听注册——
     // 事件监听慢于 setup 只能尽力而为，清理本身在 Rust 侧已完成，这里只是提示）
     await listen<number>("orphans-cleaned", (ev) => {
@@ -158,13 +172,17 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       "process-exit",
       (ev) => {
         const { projectId, code } = ev.payload;
-        // 有 waiter = 我们主动 stop 的，属正常退出；否则是崩溃/被外部杀死 → error
+        // 有 waiter / 宽限标记 = 我们主动 stop 的，属正常退出；否则是崩溃/被外部杀死 → error
         const waiter = exitWaiters.get(projectId);
-        const intentional = waiter !== undefined;
+        const grace = intentionalStops.get(projectId);
+        const intentional =
+          waiter !== undefined ||
+          (grace !== undefined && Date.now() - grace < INTENTIONAL_GRACE_MS);
         if (waiter) {
           exitWaiters.delete(projectId);
           waiter();
         }
+        if (grace !== undefined) intentionalStops.delete(projectId);
         resetConfirmedUrls(projectId);
         set((s) => ({
           runtimes: {
@@ -282,7 +300,9 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       const ok = await exited;
       const cur = get().runtimes[project.id];
       if (ok || cur?.status === "running") {
-        // 正常等到退出事件，或超时兜底（进程卡死也按已停处理，重启路径才能走下去）
+        // 正常等到退出事件，或超时兜底（进程卡死也按已停处理，重启路径才能走下去）。
+        // 超时路径打宽限标记：之后迟到的 exit 事件不再误判为崩溃弹日志
+        if (!ok) intentionalStops.set(project.id, Date.now());
         set((s) => ({
           runtimes: { ...s.runtimes, [project.id]: { status: "stopped" } },
         }));

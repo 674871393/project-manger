@@ -59,15 +59,6 @@ interface Props {
   onOpenLogs: (project: Project) => void;
 }
 
-/** 框架标识：整格淡色背景（light 主题下的低饱和底色，一眼可辨不抢眼） */
-const FRAMEWORK_BG: Record<string, string> = {
-  vite: "bg-violet-500/8",
-  next: "bg-slate-500/8",
-  nuxt: "bg-emerald-500/8",
-  webpack: "bg-blue-500/8",
-  other: "bg-muted",
-};
-
 function StatusBadge({ runtime }: { runtime?: ProjectRuntime }) {
   const status: RunStatus = runtime?.status ?? "stopped";
 
@@ -351,20 +342,18 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
                     />
                   </TableCell>
 
-                  <TableCell
-                    className={
-                      project.framework && project.framework !== "other"
-                        ? FRAMEWORK_BG[project.framework]
-                        : undefined
-                    }
-                  >
-                    <div className="flex items-center gap-2 font-medium">
+                  <TableCell className="relative overflow-hidden">
+                    {/* 框架标识：斜置背景水印，纯装饰不可选中/复制（aria-hidden + select-none） */}
+                    {project.framework && project.framework !== "other" && (
+                      <span
+                        aria-hidden="true"
+                        className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 -rotate-12 font-black tracking-[0.2em] text-lg text-foreground/10 uppercase select-none"
+                      >
+                        {project.framework}
+                      </span>
+                    )}
+                    <div className="relative flex items-center gap-2 font-medium">
                       <span className="cursor-default">{project.name}</span>
-                      {project.framework && project.framework !== "other" && (
-                        <span className="text-[10px] tracking-wide text-muted-foreground/80 uppercase">
-                          {project.framework}
-                        </span>
-                      )}
                     </div>
                   </TableCell>
 
