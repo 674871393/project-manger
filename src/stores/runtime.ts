@@ -29,13 +29,24 @@ const MAX_LOG_LINES = 2000;
  *    Next `- Local:  http://localhost:3000`
  * 2. 纯端口：Vite7 精简输出 `Port: 5173`、`listening on 3000` 等（无 http:// 前缀）
  */
+/**
+ * 剥掉 ANSI 转义序列。Vite 7/8 打包的 picocolors 在 Windows 上无条件启用颜色
+ * （判定条件含 platform === "win32"，即使 stdout 是管道也照发），Local 行实际是
+ * `➜  Local:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m`——
+ * 端口号前插着加粗码，不剥掉的话 URL_RE 永远匹配不上。
+ */
+const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
 const URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):(\d{2,5})/;
 const PORT_RE = /(?:port|端口)\D{0,8}?(\d{2,5})\b|listening on (\d{2,5})/i;
 
-/** 解析一行日志，返回端口号（无则 null） */
+/** 解析一行日志（须已剥 ANSI），返回端口号（无则 null） */
 function parsePort(line: string): number | null {
   const m1 = line.match(URL_RE);
   if (m1) return Number(m1[1]);
+  // `Port 5173 is in use, trying another one...` 里的数字是被占用的旧端口，
+  // 不是本项目实际监听的端口，拿去探测会误报（占用者恰恰在监听）
+  if (/in use|trying another|被占用/i.test(line)) return null;
   const m2 = line.match(PORT_RE);
   if (m2) return Number(m2[1] ?? m2[2]);
   return null;
@@ -156,7 +167,10 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
     await listen<{ projectId: string; stream: "stdout" | "stderr"; line: string }>(
       "log-line",
       (ev) => {
-        const { projectId, stream, line } = ev.payload;
+        const { projectId, stream, line: raw } = ev.payload;
+        // 剥 ANSI 颜色码：日志面板按纯文本渲染（不剥会显示 [36m 这类乱码），
+        // 端口解析也依赖干净文本（见 ANSI_RE 注释）
+        const line = raw.replace(ANSI_RE, "");
         set((s) => {
           const buf = [...(s.logs[projectId] ?? []), { stream, line }];
           if (buf.length > MAX_LOG_LINES) buf.splice(0, buf.length - MAX_LOG_LINES);
