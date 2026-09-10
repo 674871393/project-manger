@@ -7,7 +7,21 @@ use tauri_plugin_autostart::MacosLauncher;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    // 单实例：再次启动 exe 不开新进程，唤起已有实例的窗口
+    // （可能藏在托盘里，show + unminimize + focus 一步到位）。
+    // 注意：该插件必须最先注册，否则互斥锁建立前 UI 已起，拦截不住。
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(
+        |app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = (w.show(), w.unminimize(), w.set_focus());
+            }
+        },
+    ));
+
+    builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())

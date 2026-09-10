@@ -44,6 +44,32 @@ function parsePort(line: string): number | null {
 /** 已确认过的地址就不再重复探测（同一端口只探一次） */
 const confirmedUrls = new Set<string>();
 
+/**
+ * projectId -> 最近一次解析出的运行地址（localStorage 持久化）。
+ * 页面刷新（F5 / dev 热重载）后日志缓冲清空、旧日志不会重发，
+ * url 无从再解析，靠这份缓存恢复地址列展示。
+ */
+const URL_CACHE_KEY = "fpm:last-urls";
+
+function loadCachedUrls(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(URL_CACHE_KEY) ?? "{}");
+    return typeof parsed === "object" && parsed !== null ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function cacheUrl(projectId: string, url: string) {
+  try {
+    const all = loadCachedUrls();
+    all[projectId] = url;
+    localStorage.setItem(URL_CACHE_KEY, JSON.stringify(all));
+  } catch {
+    // localStorage 不可用（隐私模式等）：仅影响刷新后的地址回显，不致命
+  }
+}
+
 /** 进程退出/手动停止后调用：下次启动时重新解析端口 */
 function resetConfirmedUrls(projectId: string) {
   for (const key of confirmedUrls) {
@@ -147,6 +173,8 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
               confirmedUrls.add(key);
               probePort(port).then((ok) => {
                 if (!ok) return;
+                const url = `http://localhost:${port}`;
+                cacheUrl(projectId, url);
                 set((s) => {
                   const cur = s.runtimes[projectId];
                   if (!cur || cur.status === "stopped") return {};
@@ -155,7 +183,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
                       ...s.runtimes,
                       [projectId]: {
                         ...cur,
-                        url: `http://localhost:${port}`,
+                        url,
                         status: "running",
                       },
                     },
@@ -202,13 +230,19 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
   syncFromBackend: async () => {
     try {
       const running = await invoke<Record<string, number>>("get_running");
+      const cachedUrls = loadCachedUrls();
       set((s) => {
         const runtimes = { ...s.runtimes };
-        // Rust 说在跑 → 标 running；Rust 说没跑但前端显示 running → 拉回 stopped
+        // Rust 说在跑 → 标 running（url 从缓存恢复，日志已丢无法再解析）；Rust 说没跑但前端显示 running → 拉回 stopped
         for (const [id, pid] of Object.entries(running)) {
           const cur = runtimes[id];
           if (!cur || cur.status === "stopped" || cur.status === "error") {
-            runtimes[id] = { status: "running", pid, startedAt: cur?.startedAt };
+            runtimes[id] = {
+              status: "running",
+              pid,
+              startedAt: cur?.startedAt,
+              url: cachedUrls[id],
+            };
           }
         }
         for (const [id, rt] of Object.entries(runtimes)) {
