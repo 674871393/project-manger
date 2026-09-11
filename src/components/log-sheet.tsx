@@ -285,9 +285,9 @@ export function LogSheet({ project, open, onOpenChange }: Props) {
                           : "text-foreground"
                     }
                   >
-                    {l.tag === "install" && (
+                    {l.tag && (
                       <span className="mr-1 text-muted-foreground">
-                        [install]
+                        [{l.tag}]
                       </span>
                     )}
                     <HighlightedLine line={l.line} query={query} />

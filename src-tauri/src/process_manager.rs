@@ -22,7 +22,7 @@ use crate::commands::Project;
 
 /// CREATE_NO_WINDOW：spawn 和 taskkill 都要带，否则每个项目弹一个控制台黑窗
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Default)]
 pub struct ProcessManager {
@@ -246,7 +246,8 @@ impl ProcessManager {
 /// 两个读线程：stdout / stderr 各一个，按行转发 `log-line` 事件并落盘（FR-10）。
 /// 每个线程持有独立的追加写句柄；Windows 追加写以 write 调用为单位原子定位，
 /// 两句柄按行交错可接受。
-fn spawn_pipe_readers(
+/// kind："run"（dev）/ "install" / "release"，非 run 的输出落盘时加 `[kind]` 前缀区分。
+pub(crate) fn spawn_pipe_readers(
     app: &AppHandle,
     project_id: &str,
     kind: &'static str,
@@ -257,8 +258,12 @@ fn spawn_pipe_readers(
             let app_handle = app.clone();
             let project_id = project_id.to_string();
             let mut log_file = open_log_writer(app, &project_id);
-            // install 输出写盘加前缀，读回历史时能和 dev 日志区分
-            let disk_prefix = if kind == "install" { "[install] " } else { "" };
+            // install / release 输出写盘加前缀，读回历史时能和 dev 日志区分
+            let disk_prefix = if kind == "run" {
+                String::new()
+            } else {
+                format!("[{kind}] ")
+            };
             let mut written = 0u64;
             thread::spawn(move || {
                 for line in BufReader::new(pipe).lines().map_while(Result::ok) {
@@ -308,9 +313,26 @@ fn open_log_writer(app: &AppHandle, project_id: &str) -> Option<std::fs::File> {
         .ok()
 }
 
+/// 发一条工具自身的日志行（发布失败还原提示等），走同一 log-line 事件 + 落盘通道
+pub(crate) fn emit_tool_log(app: &AppHandle, project_id: &str, kind: &'static str, line: &str) {
+    let _ = app.emit(
+        "log-line",
+        LogLineEvent {
+            project_id: project_id.to_string(),
+            stream: "stdout",
+            kind,
+            line: line.to_string(),
+        },
+    );
+    if let Some(mut f) = open_log_writer(app, project_id) {
+        let prefix = if kind == "run" { "" } else { &format!("[{kind}] ") };
+        let _ = writeln!(f, "{prefix}{line}");
+    }
+}
+
 /// 把日志文件截断到尾部 LOG_FILE_KEEP_LINES 行（原子替换写）。
 /// best-effort：失败不影响启动，只是文件暂时偏大。
-fn compact_log_file(app: &AppHandle, project_id: &str) {
+pub(crate) fn compact_log_file(app: &AppHandle, project_id: &str) {
     let Some(path) = log_file_path(app, project_id) else { return };
     let Ok(content) = std::fs::read_to_string(&path) else { return };
     let lines: Vec<&str> = content.lines().collect();

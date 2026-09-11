@@ -3,6 +3,16 @@
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 export type Framework = "vite" | "next" | "nuxt" | "webpack" | "other";
 
+/** 一键发布配置（PRD FR-20，可选启用） */
+export interface ReleaseConfig {
+  /** 发布分支 */
+  branch: string;
+  /** nvm 完整版本号，如 "16.20.0" */
+  nodeVersion: string;
+  /** 构建脚本名，如 "build:prod" */
+  script: string;
+}
+
 /** 持久化到 appDataDir/projects.json */
 export interface Project {
   id: string;
@@ -13,6 +23,7 @@ export interface Project {
   manualPort?: number;
   env?: Record<string, string>;
   framework?: Framework;
+  release?: ReleaseConfig;
   createdAt: number;
 }
 

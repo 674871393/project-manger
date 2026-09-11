@@ -1,5 +1,6 @@
 mod commands;
 mod process_manager;
+mod release;
 mod settings;
 
 use tauri::Manager;
@@ -38,6 +39,8 @@ pub fn run() {
             commands::scan_projects,
             commands::check_deps,
             commands::read_log_tail,
+            commands::read_package_version,
+            release::start_release,
             process_manager::start_project,
             process_manager::stop_project,
             process_manager::install_project,

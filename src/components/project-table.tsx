@@ -12,6 +12,7 @@ import {
   Pencil,
   Play,
   RotateCcw,
+  Rocket,
   ScrollText,
   Square,
   SquareCode,
@@ -58,6 +59,8 @@ interface Props {
   onEdit: (project: Project) => void;
   /** 打开日志抽屉 */
   onOpenLogs: (project: Project) => void;
+  /** 打开发布弹窗（FR-20） */
+  onRelease: (project: Project) => void;
 }
 
 function StatusBadge({ runtime }: { runtime?: ProjectRuntime }) {
@@ -105,11 +108,12 @@ function StatusBadge({ runtime }: { runtime?: ProjectRuntime }) {
 }
 
 /** 项目列表（PRD FR-2）：勾选 | 名称 | 路径 | 运行地址 | 状态 | 分支 | 操作 */
-export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) {
+export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease }: Props) {
   const remove = useProjectsStore((s) => s.remove);
   const runtimes = useRuntimeStore((s) => s.runtimes);
   const lanIp = useRuntimeStore((s) => s.lanIp);
   const installs = useRuntimeStore((s) => s.installs);
+  const releaseRuns = useRuntimeStore((s) => s.releaseRuns);
   const start = useRuntimeStore((s) => s.start);
   const stop = useRuntimeStore((s) => s.stop);
   const restart = useRuntimeStore((s) => s.restart);
@@ -554,6 +558,31 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
                             : "安装依赖"}
                         </TooltipContent>
                       </Tooltip>
+
+                      {project.release && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              disabled={releaseRuns[project.id]?.running}
+                              onClick={() => onRelease(project)}
+                              aria-label={`发布 ${project.name}`}
+                            >
+                              {releaseRuns[project.id]?.running ? (
+                                <Loader2 className="animate-spin" />
+                              ) : (
+                                <Rocket />
+                              )}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            {releaseRuns[project.id]?.running
+                              ? "发布中…"
+                              : `发布（${project.release.branch}）`}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
 
                       {status === "running" ? (
                         <Tooltip>

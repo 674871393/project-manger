@@ -9,10 +9,31 @@ import { useProjectsStore } from "@/stores/projects";
 export interface LogLine {
   stream: "stdout" | "stderr";
   line: string;
-  /** "install"：依赖安装输出（FR-11），渲染时加前缀区分 */
-  tag?: "install";
+  /** 非来源输出：依赖安装（install）/ 一键发布（release），渲染时加前缀区分 */
+  tag?: "install" | "release";
   /** 历史日志：上次会话落盘读回（FR-10），置灰渲染 */
   historical?: boolean;
+}
+
+/** 一键发布流水线的步骤（PRD FR-20，与 Rust release.rs 对应） */
+export type ReleaseStep =
+  | "checkout"
+  | "node"
+  | "bump"
+  | "build"
+  | "zip"
+  | "restore";
+
+export type ReleaseStepStatus = "running" | "success" | "error";
+
+/** 每个项目的发布运行状态（内存，随 release-step/release-finished 事件更新） */
+export interface ReleaseRun {
+  running: boolean;
+  steps: Partial<Record<ReleaseStep, ReleaseStepStatus>>;
+  /** 步骤附注（版本号变化、zip 路径等） */
+  messages: Partial<Record<ReleaseStep, string>>;
+  zipPath?: string;
+  error?: string;
 }
 
 /** 依赖安装状态（FR-11，内存不持久化，随 install 进程事件更新） */
@@ -156,6 +177,8 @@ interface RuntimeStore {
   installs: Record<string, InstallState>;
   /** 启动时发现缺 node_modules 的项目（FR-11 预检），App 层确认弹窗消费 */
   pendingInstall: Project[];
+  /** 发布流水线运行状态（FR-20） */
+  releaseRuns: Record<string, ReleaseRun>;
 
   /** 挂一次全局事件监听（App 挂载时调用） */
   initListeners: () => Promise<void>;
@@ -173,6 +196,8 @@ interface RuntimeStore {
   stopInstall: (project: Project) => Promise<void>;
   /** 处理「未安装依赖，是否安装并启动？」的确认结果（App 层弹窗调用） */
   resolvePendingInstall: (confirmed: boolean) => void;
+  /** 启动一键发布流水线（FR-20）：进度走 release-step 事件 */
+  startRelease: (project: Project, newVersion: string) => Promise<void>;
 }
 
 export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
@@ -182,6 +207,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
   pendingErrorProjectId: null,
   installs: {},
   pendingInstall: [],
+  releaseRuns: {},
 
   initListeners: async () => {
     if (listenersReady) return;
@@ -200,8 +226,10 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       line: string;
     }>("log-line", (ev) => {
       const { projectId, stream, line: raw } = ev.payload;
-      const tag: "install" | undefined =
-        ev.payload.kind === "install" ? "install" : undefined;
+      const tag: "install" | "release" | undefined =
+        ev.payload.kind === "install" || ev.payload.kind === "release"
+          ? ev.payload.kind
+          : undefined;
       // 剥 ANSI 颜色码：日志面板按纯文本渲染（不剥会显示 [36m 这类乱码），
       // 端口解析也依赖干净文本（见 ANSI_RE 注释）
       const line = raw.replace(ANSI_RE, "");
@@ -311,6 +339,62 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
         }));
       },
     );
+
+    // 发布流水线步骤进度（FR-20）
+    await listen<{
+      projectId: string;
+      step: ReleaseStep;
+      status: ReleaseStepStatus;
+      message?: string;
+    }>("release-step", (ev) => {
+      const { projectId, step: stepName, status, message } = ev.payload;
+      set((s) => {
+        const run: ReleaseRun =
+          s.releaseRuns[projectId] ?? { running: true, steps: {}, messages: {} };
+        return {
+          releaseRuns: {
+            ...s.releaseRuns,
+            [projectId]: {
+              ...run,
+              running: true,
+              steps: { ...run.steps, [stepName]: status },
+              messages: { ...run.messages, [stepName]: message },
+            },
+          },
+        };
+      });
+    });
+
+    // 发布流水线结束（FR-20）：成功 toast + 打开入口；失败 toast + 自动弹日志抽屉
+    await listen<{
+      projectId: string;
+      success: boolean;
+      zipPath?: string;
+      error?: string;
+    }>("release-finished", (ev) => {
+      const { projectId, success, zipPath, error } = ev.payload;
+      set((s) => {
+        const run: ReleaseRun =
+          s.releaseRuns[projectId] ?? { running: false, steps: {}, messages: {} };
+        return {
+          releaseRuns: {
+            ...s.releaseRuns,
+            [projectId]: { ...run, running: false, zipPath, error },
+          },
+        };
+      });
+      const project = useProjectsStore
+        .getState()
+        .projects.find((p) => p.id === projectId);
+      if (project) {
+        if (success) {
+          toast.success(`「${project.name}」发布完成，产物：${zipPath}`);
+        } else {
+          toast.error(`「${project.name}」发布失败：${error}`);
+          set({ pendingErrorProjectId: projectId });
+        }
+      }
+    });
   },
 
   syncFromBackend: async () => {
@@ -493,6 +577,31 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
     } catch (e) {
       manualInstallStops.delete(project.id);
       toast.error(`终止「${project.name}」依赖安装失败: ${e}`);
+    }
+  },
+
+  startRelease: async (project, newVersion) => {
+    if (!project.release) {
+      toast.error("该项目未配置发布参数，请先在编辑里填写");
+      return;
+    }
+    if (get().releaseRuns[project.id]?.running) return;
+    set((s) => ({
+      releaseRuns: {
+        ...s.releaseRuns,
+        [project.id]: { running: true, steps: {}, messages: {} },
+      },
+    }));
+    try {
+      await invoke("start_release", { project, newVersion });
+    } catch (e) {
+      set((s) => ({
+        releaseRuns: {
+          ...s.releaseRuns,
+          [project.id]: { running: false, steps: {}, messages: {}, error: String(e) },
+        },
+      }));
+      toast.error(`启动发布失败: ${e}`);
     }
   },
 }));

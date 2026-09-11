@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { FolderOpen, Plus, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -22,7 +23,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { Framework, PackageManager, Project, ProjectInspection } from "@/types";
+import type {
+  Framework,
+  PackageManager,
+  Project,
+  ProjectInspection,
+  ReleaseConfig,
+} from "@/types";
 import { useProjectsStore } from "@/stores/projects";
 
 interface Props {
@@ -48,6 +55,11 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
   const [framework, setFramework] = useState<Framework | undefined>(undefined);
   /** 环境变量行（空 key 的行提交时丢弃） */
   const [envRows, setEnvRows] = useState<{ key: string; value: string }[]>([]);
+  /** 发布配置（FR-20，可选启用） */
+  const [releaseEnabled, setReleaseEnabled] = useState(false);
+  const [releaseBranch, setReleaseBranch] = useState("");
+  const [releaseNode, setReleaseNode] = useState("");
+  const [releaseScript, setReleaseScript] = useState("build:prod");
   const [submitting, setSubmitting] = useState(false);
 
   // 打开时用 initial 重置表单
@@ -64,6 +76,10 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
           ? Object.entries(initial.env).map(([key, value]) => ({ key, value }))
           : [],
       );
+      setReleaseEnabled(Boolean(initial?.release));
+      setReleaseBranch(initial?.release?.branch ?? "");
+      setReleaseNode(initial?.release?.nodeVersion ?? "");
+      setReleaseScript(initial?.release?.script ?? "build:prod");
     }
   }, [open, initial]);
 
@@ -108,6 +124,20 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
       return;
     }
 
+    // 发布配置：启用即三项都必填（半填的配置没法执行流水线）
+    let release: ReleaseConfig | undefined;
+    if (releaseEnabled) {
+      if (!releaseBranch.trim() || !releaseNode.trim() || !releaseScript.trim()) {
+        toast.error("发布配置需要完整填写：分支、node 版本、构建脚本");
+        return;
+      }
+      release = {
+        branch: releaseBranch.trim(),
+        nodeVersion: releaseNode.trim(),
+        script: releaseScript.trim(),
+      };
+    }
+
     setSubmitting(true);
     try {
       const env: Record<string, string> | undefined = (() => {
@@ -126,6 +156,7 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
         manualPort: port,
         env,
         framework,
+        release,
         createdAt: initial?.createdAt ?? Date.now(),
       };
       if (isEdit) {
@@ -286,6 +317,54 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
                 </Button>
               )}
             </div>
+          </div>
+
+          <div className="grid gap-2 rounded-lg border p-3">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <Checkbox
+                checked={releaseEnabled}
+                onCheckedChange={(v) => setReleaseEnabled(v === true)}
+                aria-label="启用一键发布"
+              />
+              发布配置（一键发版：切分支 → 切 node → 升版本 → build → zip）
+            </label>
+            {releaseEnabled && (
+              <div className="grid gap-2 pl-6">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="grid gap-2">
+                    <Label htmlFor="release-branch">发布分支</Label>
+                    <Input
+                      id="release-branch"
+                      value={releaseBranch}
+                      onChange={(e) => setReleaseBranch(e.currentTarget.value)}
+                      placeholder="如 release / master"
+                    />
+                  </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="release-node">node 版本</Label>
+                    <Input
+                      id="release-node"
+                      value={releaseNode}
+                      onChange={(e) => setReleaseNode(e.currentTarget.value)}
+                      placeholder="nvm 完整版本号，如 16.20.0"
+                    />
+                  </div>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="release-script">构建脚本</Label>
+                  <Input
+                    id="release-script"
+                    value={releaseScript}
+                    onChange={(e) => setReleaseScript(e.currentTarget.value)}
+                    placeholder="package.json scripts 里的脚本名，如 build:prod"
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  发布前要求 git 工作区干净（有未提交变更会中止）；结束后自动切回原 node
+                  版本。仅本机打包，不自动 commit / push。
+                </p>
+              </div>
+            )}
           </div>
         </div>
 

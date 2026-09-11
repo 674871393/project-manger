@@ -26,7 +26,22 @@ pub struct Project {
     pub env: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework: Option<String>,
+    /// 发布配置（FR-20，可选启用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<ReleaseConfig>,
     pub created_at: u64,
+}
+
+/// 一键发布配置（FR-20）：与前端 ReleaseConfig 对应
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseConfig {
+    /// 发布分支
+    pub branch: String,
+    /// nvm 完整版本号（如 "16.20.0"）
+    pub node_version: String,
+    /// 构建脚本名（如 "build:prod"）
+    pub script: String,
 }
 
 fn projects_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -177,6 +192,20 @@ pub fn read_git_branch(path: String) -> Result<Option<String>, String> {
 #[tauri::command]
 pub fn check_deps(path: String) -> bool {
     Path::new(&path).join("node_modules").is_dir()
+}
+
+/// 读项目 package.json 的当前 version（FR-20 发布弹窗展示用）
+#[tauri::command]
+pub fn read_package_version(path: String) -> Result<String, String> {
+    let pkg_path = Path::new(&path).join("package.json");
+    let content =
+        fs::read_to_string(&pkg_path).map_err(|e| format!("读取 package.json 失败: {e}"))?;
+    let pkg: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("package.json 解析失败: {e}"))?;
+    pkg["version"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "package.json 缺少 version 字段".into())
 }
 
 /// 读取项目落盘日志的尾部（FR-10 跨会话日志：项目未运行时展示上次会话的尾部日志）

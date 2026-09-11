@@ -12,6 +12,7 @@ import { LogSheet } from "@/components/log-sheet";
 import { ScanImportDialog } from "@/components/scan-import-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { InstallConfirmDialog } from "@/components/install-confirm-dialog";
+import { ReleaseDialog } from "@/components/release-dialog";
 import type { Project } from "@/types";
 import { useProjectsStore } from "@/stores/projects";
 import { useRuntimeStore } from "@/stores/runtime";
@@ -31,6 +32,8 @@ function App() {
   const [logOpen, setLogOpen] = useState(false);
   const [scanOpen, setScanOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [releaseProject, setReleaseProject] = useState<Project | null>(null);
+  const [releaseOpen, setReleaseOpen] = useState(false);
 
   useEffect(() => {
     load();
@@ -174,6 +177,10 @@ function App() {
                 setLogProject(p);
                 setLogOpen(true);
               }}
+              onRelease={(p) => {
+                setReleaseProject(p);
+                setReleaseOpen(true);
+              }}
             />
           )}
         </main>
@@ -187,6 +194,11 @@ function App() {
       <ScanImportDialog open={scanOpen} onOpenChange={setScanOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <InstallConfirmDialog />
+      <ReleaseDialog
+        project={releaseProject}
+        open={releaseOpen}
+        onOpenChange={setReleaseOpen}
+      />
       <LogSheet
         project={logProject}
         open={logOpen}
