@@ -10,12 +10,12 @@
 // - stdout/stderr 按行转发 `log-line` 事件，进程退出发 `process-exit` 事件（含退出码）。
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::Project;
@@ -28,6 +28,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub struct ProcessManager {
     /// projectId -> 根进程 pid（cmd.exe）；进程退出后由监控线程移除
     running: Mutex<HashMap<String, u32>>,
+    /// install 进程的 pid 表（FR-11）：与 dev 进程分开登记，
+    /// 同一项目允许一边跑 dev 一边装依赖（重装场景）
+    installing: Mutex<HashMap<String, u32>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -35,6 +38,8 @@ pub struct ProcessManager {
 struct LogLineEvent {
     project_id: String,
     stream: &'static str,
+    /// "run"（dev 脚本）| "install"（依赖安装）：前端据此加日志前缀、区分退出处理
+    kind: &'static str,
     line: String,
 }
 
@@ -42,7 +47,17 @@ struct LogLineEvent {
 #[serde(rename_all = "camelCase")]
 struct ProcessExitEvent {
     project_id: String,
+    kind: &'static str,
     code: Option<i32>,
+}
+
+/// running-pids.json 的落盘格式（v0.2 起分 run / install 两张表）
+#[derive(Serialize, Deserialize, Default)]
+struct PidsFile {
+    #[serde(default)]
+    run: HashMap<String, u32>,
+    #[serde(default)]
+    install: HashMap<String, u32>,
 }
 
 impl ProcessManager {
@@ -52,9 +67,11 @@ impl ProcessManager {
         let Ok(dir) = app.path().app_data_dir() else {
             return;
         };
-        let running = self.running.lock().unwrap().clone();
+        let run = self.running.lock().unwrap().clone();
+        let install = self.installing.lock().unwrap().clone();
         let _ = std::fs::create_dir_all(&dir);
-        if let Ok(json) = serde_json::to_string(&running) {
+        let pids = PidsFile { run, install };
+        if let Ok(json) = serde_json::to_string(&pids) {
             let _ = std::fs::write(dir.join("running-pids.json"), json);
         }
     }
@@ -64,6 +81,9 @@ impl ProcessManager {
     /// 经 cmd.exe 包一层是为了兼容 .cmd 脚本（npm.cmd 等，CreateProcess 无法直接执行）；
     /// 多出的 cmd.exe 一层由 taskkill /T 一并收掉，不构成孤儿风险。
     pub fn start(&self, app: &AppHandle, project: &Project) -> Result<u32, String> {
+        // 先把上次的落盘日志截断到尾部，保证文件大小有界（FR-10）
+        compact_log_file(app, &project.id);
+
         // 锁内完成「查重 + spawn + 登记」，避免双击启动产生两个进程
         let mut child = {
             let mut running = self.running.lock().unwrap();
@@ -98,29 +118,12 @@ impl ProcessManager {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        // 两个读线程：stdout / stderr 各一个，按行转发事件
+        // 两个读线程：stdout / stderr 各一个，按行转发事件并落盘（FR-10）
         // （擦成 Box<dyn Read> 才能放进同一个数组——两个管道类型不同）
         let pipes: [(&str, Option<Box<dyn std::io::Read + Send>>); 2] =
             [("stdout", stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
              ("stderr", stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>))];
-        for (stream, pipe) in pipes {
-            if let Some(pipe) = pipe {
-                let app_handle = app.clone();
-                let project_id = project.id.clone();
-                thread::spawn(move || {
-                    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                        let _ = app_handle.emit(
-                            "log-line",
-                            LogLineEvent {
-                                project_id: project_id.clone(),
-                                stream,
-                                line,
-                            },
-                        );
-                    }
-                });
-            }
-        }
+        spawn_pipe_readers(app, &project.id, "run", pipes);
 
         // 监控线程：等进程退出，上报退出码并从 pid 表移除
         let app_handle = app.clone();
@@ -131,11 +134,68 @@ impl ProcessManager {
                 "process-exit",
                 ProcessExitEvent {
                     project_id: project_id.clone(),
+                    kind: "run",
                     code,
                 },
             );
             if let Some(mgr) = app_handle.try_state::<ProcessManager>() {
                 mgr.running.lock().unwrap().remove(&project_id);
+                mgr.persist_pids(&app_handle);
+            }
+        });
+
+        self.persist_pids(app);
+        Ok(pid)
+    }
+
+    /// 安装依赖（FR-11）：`cmd /C "<pm> install"`。
+    /// 日志走同一套事件与落盘通道（kind = "install" 区分），可与 dev 进程并存。
+    pub fn install(&self, app: &AppHandle, project: &Project) -> Result<u32, String> {
+        let mut child = {
+            let mut installing = self.installing.lock().unwrap();
+            if installing.contains_key(&project.id) {
+                return Err("依赖正在安装中".into());
+            }
+            let mut cmd = Command::new("cmd");
+            cmd.args(["/C", &format!("{} install", project.package_manager)])
+                .current_dir(&project.path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let child = cmd
+                .spawn()
+                .map_err(|e| format!("安装命令执行失败（检查包管理器是否可用）: {e}"))?;
+            installing.insert(project.id.clone(), child.id());
+            child
+        };
+
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let pipes: [(&str, Option<Box<dyn std::io::Read + Send>>); 2] =
+            [("stdout", stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
+             ("stderr", stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>))];
+        spawn_pipe_readers(app, &project.id, "install", pipes);
+
+        let app_handle = app.clone();
+        let project_id = project.id.clone();
+        thread::spawn(move || {
+            let code = child.wait().ok().and_then(|s| s.code());
+            let _ = app_handle.emit(
+                "process-exit",
+                ProcessExitEvent {
+                    project_id: project_id.clone(),
+                    kind: "install",
+                    code,
+                },
+            );
+            if let Some(mgr) = app_handle.try_state::<ProcessManager>() {
+                mgr.installing.lock().unwrap().remove(&project_id);
                 mgr.persist_pids(&app_handle);
             }
         });
@@ -162,15 +222,107 @@ impl ProcessManager {
         }
     }
 
-    /// 应用退出前调用：杀掉全部进程树，失败只忽略（此时已无 UI 可报）
+    /// 停止依赖安装进程（安装卡死时的手动兜底，幂等：没在装直接成功）
+    pub fn stop_install(&self, project_id: &str) -> Result<(), String> {
+        let Some(pid) = self.installing.lock().unwrap().get(project_id).copied() else {
+            return Ok(());
+        };
+        kill_tree(pid)
+    }
+
+    /// 应用退出前调用：杀掉全部进程树（dev + install），失败只忽略（此时已无 UI 可报）
     pub fn stop_all(&self, app: &AppHandle) {
-        let pids: Vec<u32> = self.running.lock().unwrap().values().copied().collect();
+        let mut pids: Vec<u32> = self.running.lock().unwrap().values().copied().collect();
+        pids.extend(self.installing.lock().unwrap().values().copied());
         for pid in pids {
             let _ = kill_tree(pid);
         }
         self.running.lock().unwrap().clear();
+        self.installing.lock().unwrap().clear();
         self.persist_pids(app);
     }
+}
+
+/// 两个读线程：stdout / stderr 各一个，按行转发 `log-line` 事件并落盘（FR-10）。
+/// 每个线程持有独立的追加写句柄；Windows 追加写以 write 调用为单位原子定位，
+/// 两句柄按行交错可接受。
+fn spawn_pipe_readers(
+    app: &AppHandle,
+    project_id: &str,
+    kind: &'static str,
+    pipes: [(&'static str, Option<Box<dyn std::io::Read + Send>>); 2],
+) {
+    for (stream, pipe) in pipes {
+        if let Some(pipe) = pipe {
+            let app_handle = app.clone();
+            let project_id = project_id.to_string();
+            let mut log_file = open_log_writer(app, &project_id);
+            // install 输出写盘加前缀，读回历史时能和 dev 日志区分
+            let disk_prefix = if kind == "install" { "[install] " } else { "" };
+            let mut written = 0u64;
+            thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    if let Some(f) = log_file.as_mut() {
+                        if written < LOG_FILE_SESSION_MAX_BYTES {
+                            if writeln!(f, "{disk_prefix}{line}").is_ok() {
+                                written += line.len() as u64 + 1;
+                            }
+                        }
+                    }
+                    let _ = app_handle.emit(
+                        "log-line",
+                        LogLineEvent {
+                            project_id: project_id.clone(),
+                            stream,
+                            kind,
+                            line,
+                        },
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// 每项目日志文件（appDataDir/logs/<projectId>.log，FR-10 跨会话日志）
+fn log_file_path(app: &AppHandle, project_id: &str) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("logs").join(format!("{project_id}.log")))
+}
+
+/// 落盘保留的行数上限。截断时机放在「该项目下次启动前」（compact_log_file）：
+/// 文件大小 ≤ 上次截断后的尾部 + 单次会话写入上限，有界且运行期零额外开销。
+const LOG_FILE_KEEP_LINES: usize = 2000;
+/// 单管道单会话写盘上限：watch 模式刷屏项目不至于把磁盘写爆
+const LOG_FILE_SESSION_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+fn open_log_writer(app: &AppHandle, project_id: &str) -> Option<std::fs::File> {
+    let path = log_file_path(app, project_id)?;
+    std::fs::create_dir_all(path.parent()?).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// 把日志文件截断到尾部 LOG_FILE_KEEP_LINES 行（原子替换写）。
+/// best-effort：失败不影响启动，只是文件暂时偏大。
+fn compact_log_file(app: &AppHandle, project_id: &str) {
+    let Some(path) = log_file_path(app, project_id) else { return };
+    let Ok(content) = std::fs::read_to_string(&path) else { return };
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= LOG_FILE_KEEP_LINES {
+        return;
+    }
+    let kept = lines[lines.len() - LOG_FILE_KEEP_LINES..].join("\n");
+    let tmp = path.with_extension("log.tmp");
+    let rewrite = std::fs::File::create(&tmp)
+        .and_then(|mut f| f.write_all(kept.as_bytes()))
+        .and_then(|_| std::fs::rename(&tmp, &path));
+    let _ = rewrite;
 }
 
 /// 应用启动时清理上次崩溃残留的孤儿进程（PRD 7）。
@@ -182,13 +334,21 @@ pub fn cleanup_orphans(app: &AppHandle) {
     let Ok(content) = std::fs::read_to_string(dir.join("running-pids.json")) else {
         return;
     };
-    let Ok(pids) = serde_json::from_str::<HashMap<String, u32>>(&content) else {
-        let _ = std::fs::remove_file(dir.join("running-pids.json"));
-        return;
+    // v0.2 起是 {run, install} 双表；v0.1 是纯 HashMap（uuid -> pid），全部按 run 处理
+    let pids: Vec<u32> = match serde_json::from_str::<PidsFile>(&content) {
+        Ok(f) if !(f.run.is_empty() && f.install.is_empty()) => f
+            .run
+            .values()
+            .chain(f.install.values())
+            .copied()
+            .collect(),
+        _ => serde_json::from_str::<HashMap<String, u32>>(&content)
+            .map(|m| m.values().copied().collect())
+            .unwrap_or_default(),
     };
     let mut cleaned = 0u32;
-    for pid in pids.values() {
-        if orphan_matches_dev_process(*pid) && kill_tree(*pid).is_ok() {
+    for pid in pids {
+        if orphan_matches_dev_process(pid) && kill_tree(pid).is_ok() {
             cleaned += 1;
         }
     }
@@ -247,6 +407,22 @@ pub fn start_project(
 #[tauri::command]
 pub fn stop_project(state: State<ProcessManager>, project_id: String) -> Result<(), String> {
     state.stop(&project_id)
+}
+
+/// 安装依赖（FR-11）：与 start_project 同一套 spawn 框架，事件带 kind = "install"
+#[tauri::command]
+pub fn install_project(
+    app: AppHandle,
+    state: State<ProcessManager>,
+    project: Project,
+) -> Result<u32, String> {
+    state.install(&app, &project)
+}
+
+/// 停止依赖安装（安装卡死时手动兜底）
+#[tauri::command]
+pub fn stop_install(state: State<ProcessManager>, project_id: String) -> Result<(), String> {
+    state.stop_install(&project_id)
 }
 
 /// 当前运行中的 projectId -> pid 表。

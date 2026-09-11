@@ -172,6 +172,106 @@ pub fn read_git_branch(path: String) -> Result<Option<String>, String> {
     }
 }
 
+/// 依赖预检（FR-11）：node_modules 是否已安装。
+/// 返回 bool 而非 Result：目录不存在/读不了都视为「未安装」，让用户走 install 流程。
+#[tauri::command]
+pub fn check_deps(path: String) -> bool {
+    Path::new(&path).join("node_modules").is_dir()
+}
+
+/// 读取项目落盘日志的尾部（FR-10 跨会话日志：项目未运行时展示上次会话的尾部日志）
+#[tauri::command]
+pub fn read_log_tail(
+    app: tauri::AppHandle,
+    project_id: String,
+    max_lines: usize,
+) -> Result<Vec<String>, String> {
+    use tauri::Manager;
+
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法定位应用数据目录: {e}"))?
+        .join("logs");
+    read_log_tail_from(&dir.join(format!("{project_id}.log")), max_lines)
+}
+
+/// 从文件尾部读取最多 max_lines 行。只回看固定 256KB，避免大文件全量读入内存；
+/// 若从文件中间起读，首行可能是不完整的半行，直接丢弃。
+fn read_log_tail_from(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const LOOKBACK_BYTES: u64 = 256 * 1024;
+
+    let mut file = fs::File::open(path).map_err(|e| format!("读取日志失败: {e}"))?;
+    let len = file.metadata().map_err(|e| format!("读取日志元数据失败: {e}"))?.len();
+    let start = len.saturating_sub(LOOKBACK_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("定位日志读取位置失败: {e}"))?;
+
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)
+        .map_err(|e| format!("读取日志失败: {e}"))?;
+    let text = String::from_utf8_lossy(&raw);
+
+    let mut lines: Vec<&str> = text.lines().collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0); // 丢弃起读位置切出来的半行
+    }
+    let from = lines.len().saturating_sub(max_lines);
+    Ok(lines[from..].iter().map(|s| s.to_string()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_log_tail_from;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// 临时测试文件：进程退出时由 TempDir 语义手动清理（不引 tempfile 依赖）
+    struct TempLog(PathBuf);
+    impl TempLog {
+        fn new(content: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fpm-log-test-{}.log",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::write(&path, content).unwrap();
+            TempLog(path)
+        }
+    }
+    impl Drop for TempLog {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn tail_returns_last_n_lines_in_order() {
+        let content: String = (0..100).map(|i| format!("line-{i}\n")).collect();
+        let tmp = TempLog::new(&content);
+        let tail = read_log_tail_from(&tmp.0, 3).unwrap();
+        assert_eq!(tail, vec!["line-97", "line-98", "line-99"]);
+    }
+
+    #[test]
+    fn tail_short_file_returns_everything() {
+        let tmp = TempLog::new("a\nb\n");
+        let tail = read_log_tail_from(&tmp.0, 10).unwrap();
+        assert_eq!(tail, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tail_empty_file_returns_empty() {
+        let tmp = TempLog::new("");
+        let tail = read_log_tail_from(&tmp.0, 5).unwrap();
+        assert!(tail.is_empty());
+    }
+}
+
 /// 目录扫描结果（复用 inspect_project 的识别逻辑）
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

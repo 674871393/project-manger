@@ -11,6 +11,7 @@ import { ProjectTable } from "@/components/project-table";
 import { LogSheet } from "@/components/log-sheet";
 import { ScanImportDialog } from "@/components/scan-import-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
+import { InstallConfirmDialog } from "@/components/install-confirm-dialog";
 import type { Project } from "@/types";
 import { useProjectsStore } from "@/stores/projects";
 import { useRuntimeStore } from "@/stores/runtime";
@@ -185,6 +186,7 @@ function App() {
       />
       <ScanImportDialog open={scanOpen} onOpenChange={setScanOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <InstallConfirmDialog />
       <LogSheet
         project={logProject}
         open={logOpen}

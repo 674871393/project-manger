@@ -5,6 +5,7 @@ import {
   Circle,
   CircleX,
   Copy,
+  Download,
   FolderOpen,
   GitBranch,
   Loader2,
@@ -108,11 +109,15 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
   const remove = useProjectsStore((s) => s.remove);
   const runtimes = useRuntimeStore((s) => s.runtimes);
   const lanIp = useRuntimeStore((s) => s.lanIp);
+  const installs = useRuntimeStore((s) => s.installs);
   const start = useRuntimeStore((s) => s.start);
   const stop = useRuntimeStore((s) => s.stop);
   const restart = useRuntimeStore((s) => s.restart);
+  const install = useRuntimeStore((s) => s.install);
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // 「依赖已装，确认重装？」的待确认项目（PRD 6.3 安装依赖流程）
+  const [reinstallProject, setReinstallProject] = useState<Project | null>(null);
 
   const toggleSelected = (id: string, checked: boolean) => {
     setSelected((prev) => {
@@ -140,9 +145,21 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
       toast.info("选中的项目都已在运行");
       return;
     }
-    // 逐个 await，避免同时 spawn 多个 cmd 抢锁（start 内部锁是短临界区，串行即可）
-    for (const p of targets) await start(p);
-    toast.success(`已批量启动 ${targets.length} 个项目`);
+    // 逐个 await，避免同时 spawn 多个 cmd 抢锁（start 内部锁是短临界区，串行即可）。
+    // 返回 false 的项目缺依赖，已转入「安装并启动」确认流程（FR-11）
+    let started = 0;
+    let diverted = 0;
+    for (const p of targets) {
+      if (await start(p)) started++;
+      else diverted++;
+    }
+    if (diverted > 0) {
+      toast.info(
+        `已启动 ${started} 个，${diverted} 个缺依赖待确认安装`,
+      );
+    } else {
+      toast.success(`已批量启动 ${started} 个项目`);
+    }
   }
 
   async function handleBatchStop() {
@@ -186,6 +203,48 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
     } else {
       toast.warning(`${ok}/${selectedProjects.length} 个项目已打开，部分失败`);
     }
+  }
+
+  /** 单项目安装（FR-11）：已装过 → 二次确认重装；未装 → 直接安装 */
+  async function handleInstall(project: Project) {
+    try {
+      const hasDeps = await invoke<boolean>("check_deps", { path: project.path });
+      if (hasDeps) {
+        setReinstallProject(project);
+        return;
+      }
+    } catch {
+      // 预检失败按未安装处理，直接走安装
+    }
+    install(project);
+  }
+
+  /** 批量安装（FR-11，验收 13）：各项目独立成败，互不阻塞 */
+  async function handleBatchInstall() {
+    const missing: Project[] = [];
+    let skipped = 0;
+    for (const p of selectedProjects) {
+      try {
+        const hasDeps = await invoke<boolean>("check_deps", { path: p.path });
+        if (hasDeps) {
+          skipped++;
+          continue;
+        }
+      } catch {
+        // 预检失败按未安装处理
+      }
+      missing.push(p);
+    }
+    if (missing.length === 0) {
+      toast.info("选中的项目依赖都已安装，无需重装");
+      return;
+    }
+    // 并行安装：每个项目独立进程，完成/失败各自 toast
+    for (const p of missing) void install(p);
+    toast.success(
+      `已开始为 ${missing.length} 个项目安装依赖` +
+        (skipped > 0 ? `，${skipped} 个已安装跳过` : ""),
+    );
   }
 
   async function handleBatchDelete() {
@@ -255,6 +314,15 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
           >
             <RotateCcw />
             批量重启
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={selectedProjects.length === 0}
+            onClick={handleBatchInstall}
+          >
+            <Download />
+            批量安装
           </Button>
           <Button
             variant="outline"
@@ -464,6 +532,29 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
                         <TooltipContent>在 VSCode 中打开</TooltipContent>
                       </Tooltip>
 
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            disabled={installs[project.id]?.status === "running"}
+                            onClick={() => handleInstall(project)}
+                            aria-label={`安装 ${project.name} 依赖`}
+                          >
+                            {installs[project.id]?.status === "running" ? (
+                              <Loader2 className="animate-spin" />
+                            ) : (
+                              <Download />
+                            )}
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {installs[project.id]?.status === "running"
+                            ? "依赖安装中…"
+                            : "安装依赖"}
+                        </TooltipContent>
+                      </Tooltip>
+
                       {status === "running" ? (
                         <Tooltip>
                           <TooltipTrigger asChild>
@@ -567,6 +658,34 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs }: Props) 
           </TableBody>
         </Table>
       </div>
+
+      {/* 依赖已存在时的重装确认（PRD 6.3 安装依赖流程） */}
+      <AlertDialog
+        open={reinstallProject !== null}
+        onOpenChange={(o) => !o && setReinstallProject(null)}
+      >
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              重新安装「{reinstallProject?.name}」依赖？
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              node_modules 已存在。重新安装会按 lockfile 覆盖现有依赖，可能需要一些时间。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                if (reinstallProject) install(reinstallProject);
+                setReinstallProject(null);
+              }}
+            >
+              重装
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

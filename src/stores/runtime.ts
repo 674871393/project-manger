@@ -3,12 +3,28 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import type { Project, RunStatus } from "@/types";
+import { useProjectsStore } from "@/stores/projects";
 
 /** 单条日志（stdout/stderr 合并流，保留来源用于着色） */
 export interface LogLine {
   stream: "stdout" | "stderr";
   line: string;
+  /** "install"：依赖安装输出（FR-11），渲染时加前缀区分 */
+  tag?: "install";
+  /** 历史日志：上次会话落盘读回（FR-10），置灰渲染 */
+  historical?: boolean;
 }
+
+/** 依赖安装状态（FR-11，内存不持久化，随 install 进程事件更新） */
+export interface InstallState {
+  status: "running" | "success" | "error" | "stopped";
+  exitCode?: number;
+  /** 安装成功后自动启动项目（「安装并启动」确认用） */
+  thenStart: boolean;
+}
+
+/** 手动终止安装的项目（时间无关）：install 退出事件据此跳过「安装失败」误报 */
+const manualInstallStops = new Set<string>();
 
 /** 每个项目的运行时状态（内存，不持久化） */
 export interface ProjectRuntime {
@@ -136,6 +152,10 @@ interface RuntimeStore {
   lanIp: string | null;
   /** error 时自动弹日志抽屉（PRD 4.3），App 层消费后清空 */
   pendingErrorProjectId: string | null;
+  /** 依赖安装状态（FR-11） */
+  installs: Record<string, InstallState>;
+  /** 启动时发现缺 node_modules 的项目（FR-11 预检），App 层确认弹窗消费 */
+  pendingInstall: Project[];
 
   /** 挂一次全局事件监听（App 挂载时调用） */
   initListeners: () => Promise<void>;
@@ -143,9 +163,16 @@ interface RuntimeStore {
   syncFromBackend: () => Promise<void>;
   loadLanIp: () => Promise<void>;
   clearLogs: (projectId: string) => void;
-  start: (project: Project) => Promise<void>;
+  /** 启动项目；返回是否真正下发启动（false = 已在运行或转入了安装确认流程） */
+  start: (project: Project) => Promise<boolean>;
   stop: (project: Project) => Promise<void>;
   restart: (project: Project) => Promise<void>;
+  /** 安装依赖（FR-11）；thenStart = 安装成功后自动启动 */
+  install: (project: Project, opts?: { thenStart?: boolean }) => Promise<void>;
+  /** 终止依赖安装（安装卡死时的手动兜底） */
+  stopInstall: (project: Project) => Promise<void>;
+  /** 处理「未安装依赖，是否安装并启动？」的确认结果（App 层弹窗调用） */
+  resolvePendingInstall: (confirmed: boolean) => void;
 }
 
 export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
@@ -153,6 +180,8 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
   logs: {},
   lanIp: null,
   pendingErrorProjectId: null,
+  installs: {},
+  pendingInstall: [],
 
   initListeners: async () => {
     if (listenersReady) return;
@@ -164,56 +193,99 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       toast.info(`检测到上次异常退出，已清理 ${ev.payload} 个残留进程`);
     });
 
-    await listen<{ projectId: string; stream: "stdout" | "stderr"; line: string }>(
-      "log-line",
-      (ev) => {
-        const { projectId, stream, line: raw } = ev.payload;
-        // 剥 ANSI 颜色码：日志面板按纯文本渲染（不剥会显示 [36m 这类乱码），
-        // 端口解析也依赖干净文本（见 ANSI_RE 注释）
-        const line = raw.replace(ANSI_RE, "");
-        set((s) => {
-          const buf = [...(s.logs[projectId] ?? []), { stream, line }];
-          if (buf.length > MAX_LOG_LINES) buf.splice(0, buf.length - MAX_LOG_LINES);
-          return { logs: { ...s.logs, [projectId]: buf } };
-        });
+    await listen<{
+      projectId: string;
+      stream: "stdout" | "stderr";
+      kind?: string;
+      line: string;
+    }>("log-line", (ev) => {
+      const { projectId, stream, line: raw } = ev.payload;
+      const tag: "install" | undefined =
+        ev.payload.kind === "install" ? "install" : undefined;
+      // 剥 ANSI 颜色码：日志面板按纯文本渲染（不剥会显示 [36m 这类乱码），
+      // 端口解析也依赖干净文本（见 ANSI_RE 注释）
+      const line = raw.replace(ANSI_RE, "");
+      set((s) => {
+        const buf = [...(s.logs[projectId] ?? []), { stream, line, tag }];
+        if (buf.length > MAX_LOG_LINES) buf.splice(0, buf.length - MAX_LOG_LINES);
+        return { logs: { ...s.logs, [projectId]: buf } };
+      });
 
-        // 端口解析：starting/running 期间匹配到端口就探测并更新（PRD FR-5）
-        const rt = get().runtimes[projectId];
-        if (rt && (rt.status === "starting" || rt.status === "running")) {
-          const port = parsePort(line);
-          if (port !== null) {
-            const key = `${projectId}:${port}`;
-            if (!confirmedUrls.has(key)) {
-              confirmedUrls.add(key);
-              probePort(port).then((ok) => {
-                if (!ok) return;
-                const url = `http://localhost:${port}`;
-                cacheUrl(projectId, url);
-                set((s) => {
-                  const cur = s.runtimes[projectId];
-                  if (!cur || cur.status === "stopped") return {};
-                  return {
-                    runtimes: {
-                      ...s.runtimes,
-                      [projectId]: {
-                        ...cur,
-                        url,
-                        status: "running",
-                      },
+      // 端口解析：starting/running 期间匹配到端口就探测并更新（PRD FR-5）
+      const rt = get().runtimes[projectId];
+      if (rt && (rt.status === "starting" || rt.status === "running")) {
+        const port = parsePort(line);
+        if (port !== null) {
+          const key = `${projectId}:${port}`;
+          if (!confirmedUrls.has(key)) {
+            confirmedUrls.add(key);
+            probePort(port).then((ok) => {
+              if (!ok) return;
+              const url = `http://localhost:${port}`;
+              cacheUrl(projectId, url);
+              set((s) => {
+                const cur = s.runtimes[projectId];
+                if (!cur || cur.status === "stopped") return {};
+                return {
+                  runtimes: {
+                    ...s.runtimes,
+                    [projectId]: {
+                      ...cur,
+                      url,
+                      status: "running",
                     },
-                  };
-                });
+                  },
+                };
               });
-            }
+            });
           }
         }
-      },
-    );
+      }
+    });
 
-    await listen<{ projectId: string; code: number | null }>(
+    await listen<{ projectId: string; code: number | null; kind?: string }>(
       "process-exit",
       (ev) => {
         const { projectId, code } = ev.payload;
+
+        // 依赖安装进程退出（FR-11）：更新 installs 状态；
+        // 成功且带 thenStart → 接着启动项目；失败 → toast + 自动弹日志抽屉
+        if (ev.payload.kind === "install") {
+          const st = get().installs[projectId];
+          if (st && st.status === "running") {
+            const manual = manualInstallStops.has(projectId);
+            manualInstallStops.delete(projectId);
+            const success = !manual && code === 0;
+            set((s) => ({
+              installs: {
+                ...s.installs,
+                [projectId]: {
+                  status: manual ? "stopped" : success ? "success" : "error",
+                  exitCode: code ?? undefined,
+                  thenStart: false,
+                },
+              },
+            }));
+            const project = useProjectsStore
+              .getState()
+              .projects.find((p) => p.id === projectId);
+            if (project) {
+              if (manual) {
+                toast.info(`已终止「${project.name}」依赖安装`);
+              } else if (success) {
+                toast.success(`「${project.name}」依赖安装完成`);
+                if (st.thenStart) void get().start(project);
+              } else {
+                toast.error(
+                  `「${project.name}」依赖安装失败（退出码 ${code ?? "未知"}），详见日志`,
+                );
+                set({ pendingErrorProjectId: projectId });
+              }
+            }
+          }
+          return;
+        }
+
         // 有 waiter / 宽限标记 = 我们主动 stop 的，属正常退出；否则是崩溃/被外部杀死 → error
         const waiter = exitWaiters.get(projectId);
         const grace = intentionalStops.get(projectId);
@@ -284,7 +356,24 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
 
   start: async (project) => {
     const rt = get().runtimes[project.id];
-    if (rt && (rt.status === "running" || rt.status === "starting")) return;
+    if (rt && (rt.status === "running" || rt.status === "starting")) return false;
+
+    // 依赖预检（FR-11）：node_modules 缺失 → 转入「安装并启动」确认流程（App 层弹窗消费），
+    // 不直接启动——直接跑只会看到一屏 module not found 报错
+    try {
+      const hasDeps = await invoke<boolean>("check_deps", { path: project.path });
+      if (!hasDeps) {
+        set((s) => ({
+          pendingInstall: [
+            ...s.pendingInstall.filter((p) => p.id !== project.id),
+            project,
+          ],
+        }));
+        return false;
+      }
+    } catch {
+      // 预检本身失败不阻塞：按原流程启动，真有问题走 error 流程
+    }
 
     // 端口冲突预警（PRD FR-5 P1）：配置了手动端口且已被占用 → 警告但不阻止
     // （脚手架可能自动换端口，实际以日志解析为准）
@@ -318,6 +407,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
           },
         };
       });
+      return true;
     } catch (e) {
       // 前端状态与 Rust pid 表失同步（页面重载后常见）：同步真实状态再展示
       await get().syncFromBackend();
@@ -334,6 +424,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       if (!stillRunning) {
         toast.error(`启动「${project.name}」失败: ${e}`);
       }
+      return stillRunning;
     }
   },
 
@@ -364,5 +455,44 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
   restart: async (project) => {
     await get().stop(project);
     await get().start(project);
+  },
+
+  install: async (project, opts) => {
+    if (get().installs[project.id]?.status === "running") return;
+    set((s) => ({
+      installs: {
+        ...s.installs,
+        [project.id]: { status: "running", thenStart: opts?.thenStart ?? false },
+      },
+    }));
+    try {
+      await invoke<number>("install_project", { project });
+    } catch (e) {
+      set((s) => ({
+        installs: {
+          ...s.installs,
+          [project.id]: { status: "error", thenStart: false },
+        },
+      }));
+      toast.error(`安装「${project.name}」依赖失败: ${e}`);
+    }
+  },
+
+  resolvePendingInstall: (confirmed) => {
+    const pending = get().pendingInstall;
+    set({ pendingInstall: [] });
+    if (confirmed) {
+      for (const p of pending) void get().install(p, { thenStart: true });
+    }
+  },
+
+  stopInstall: async (project) => {
+    manualInstallStops.add(project.id);
+    try {
+      await invoke("stop_install", { projectId: project.id });
+    } catch (e) {
+      manualInstallStops.delete(project.id);
+      toast.error(`终止「${project.name}」依赖安装失败: ${e}`);
+    }
   },
 }));
