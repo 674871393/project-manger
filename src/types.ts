@@ -13,6 +13,20 @@ export interface ReleaseConfig {
   script: string;
 }
 
+/** read_release_context 的返回（FR-20 发布弹窗：版本基准 + 工作区状态） */
+export interface ReleaseContext {
+  /** 发布基准：发布分支上已提交的 package.json 版本 */
+  releaseVersion: string;
+  /** 实际取到基准的引用（本地分支名，或回退的 origin/<分支>） */
+  releaseRef: string;
+  /** 当前工作区分支（detached HEAD 时为短哈希） */
+  currentBranch: string | null;
+  /** 当前工作区 package.json 的版本（可能与发布基准不同） */
+  workingVersion: string | null;
+  /** 工作区是否有未提交变更（有则发布会先被预检拦下） */
+  dirty: boolean;
+}
+
 /** 持久化到 appDataDir/projects.json */
 export interface Project {
   id: string;

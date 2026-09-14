@@ -17,6 +17,7 @@ export interface LogLine {
 
 /** 一键发布流水线的步骤（PRD FR-20，与 Rust release.rs 对应） */
 export type ReleaseStep =
+  | "precheck"
   | "checkout"
   | "node"
   | "bump"
@@ -196,8 +197,13 @@ interface RuntimeStore {
   stopInstall: (project: Project) => Promise<void>;
   /** 处理「未安装依赖，是否安装并启动？」的确认结果（App 层弹窗调用） */
   resolvePendingInstall: (confirmed: boolean) => void;
-  /** 启动一键发布流水线（FR-20）：进度走 release-step 事件 */
-  startRelease: (project: Project, newVersion: string) => Promise<void>;
+  /** 启动一键发布流水线（FR-20）：进度走 release-step 事件。
+   * expectedVersion 是弹窗确认过的版本基准，Rust 在 checkout 后据此校验是否已变化 */
+  startRelease: (
+    project: Project,
+    newVersion: string,
+    expectedVersion: string,
+  ) => Promise<void>;
 }
 
 export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
@@ -580,7 +586,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
     }
   },
 
-  startRelease: async (project, newVersion) => {
+  startRelease: async (project, newVersion, expectedVersion) => {
     if (!project.release) {
       toast.error("该项目未配置发布参数，请先在编辑里填写");
       return;
@@ -593,7 +599,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       },
     }));
     try {
-      await invoke("start_release", { project, newVersion });
+      await invoke("start_release", { project, newVersion, expectedVersion });
     } catch (e) {
       set((s) => ({
         releaseRuns: {

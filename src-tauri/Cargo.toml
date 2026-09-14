@@ -28,6 +28,8 @@ serde_json = "1"
 local-ip-address = "0.6"
 tauri-plugin-single-instance = "2.4.4"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# 仅用 Local 取本地日期（zip 文件名）；本就是依赖树里的传递依赖，不增加体积
+chrono = "0.4"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

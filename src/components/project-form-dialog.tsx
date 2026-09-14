@@ -131,6 +131,20 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
         toast.error("发布配置需要完整填写：分支、node 版本、构建脚本");
         return;
       }
+      // 命令在 Rust 侧是 `cmd /C` 拼接执行的：含空格或 & | 等元字符会被拆成
+      // 别的命令，这里与 start_release 的白名单保持一致（分支额外允许 /）
+      if (!/^[\w\-./:+@]+$/.test(releaseBranch.trim())) {
+        toast.error("发布分支含非法字符（仅允许字母数字与 - _ . /）");
+        return;
+      }
+      if (!/^[\w\-.:+@]+$/.test(releaseNode.trim())) {
+        toast.error("node 版本含非法字符（应为形如 16.20.0 的完整版本号）");
+        return;
+      }
+      if (!/^[\w\-.:+@]+$/.test(releaseScript.trim())) {
+        toast.error("构建脚本名含非法字符（仅允许字母数字与 - _ . : @ +）");
+        return;
+      }
       release = {
         branch: releaseBranch.trim(),
         nodeVersion: releaseNode.trim(),
