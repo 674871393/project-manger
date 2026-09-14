@@ -69,7 +69,7 @@ function StatusBadge({ runtime }: { runtime?: ProjectRuntime }) {
   if (status === "running") {
     return (
       <Badge className="gap-1.5 border-transparent bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
-        <Circle className="size-2 fill-current" />
+        <Circle className="size-2 animate-breathe fill-current motion-reduce:animate-none" />
         运行中
       </Badge>
     );
@@ -562,10 +562,11 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                       {project.release && (
                         <Tooltip>
                           <TooltipTrigger asChild>
+                            {/* 发布中也不置灰：点开就是进度视图，是「后台运行」之后
+                                唯一能回到流水线的地方 */}
                             <Button
                               variant="ghost"
                               size="icon"
-                              disabled={releaseRuns[project.id]?.running}
                               onClick={() => onRelease(project)}
                               aria-label={`发布 ${project.name}`}
                             >
@@ -578,7 +579,7 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                           </TooltipTrigger>
                           <TooltipContent>
                             {releaseRuns[project.id]?.running
-                              ? "发布中…"
+                              ? "发布中…（点击查看进度）"
                               : `发布（${project.release.branch}）`}
                           </TooltipContent>
                         </Tooltip>

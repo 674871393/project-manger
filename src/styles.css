@@ -48,6 +48,19 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  /* 运行中指示灯的呼吸：缩放 + 淡入淡出；偏好减少动效时用 motion-reduce:animate-none 关掉 */
+  --animate-breathe: breathe 1.6s ease-in-out infinite;
+  @keyframes breathe {
+    0%,
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.35;
+      transform: scale(0.7);
+    }
+  }
 }
 
 /* Zinc Light（shadcn 官方 zinc 亮色调色板，单主题不切换） */
