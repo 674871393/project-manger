@@ -13,6 +13,8 @@ export interface ReleaseConfig {
   script: string;
   /** 相对项目目录，旧配置默认 dist */
   outputDir?: string;
+  /** 缺省识别常用路径，空字符串关闭同步，其他值指定项目内的 JSON 文件 */
+  versionLogPath?: string;
   /**
    * 预检额外忽略的路径（文件名、相对路径或简单 glob）。
    * `.env.development` 始终忽略，不必写在这里。
@@ -39,6 +41,27 @@ export interface ReleaseContext {
   /** pnpm-workspace.yaml 的差异只有 allowBuilds 块 */
   allowBuildsIgnored: boolean;
   allowBuildsChanges: { package: string; before: string | null; after: string | null }[];
+  releaseDate: string;
+  versionLog: VersionLogPreview | null;
+}
+
+export interface VersionLogEntry {
+  version: string;
+  date: string;
+  list: string[];
+}
+
+export interface VersionLogPreview {
+  path: string;
+  revision: string;
+  latest: VersionLogEntry | null;
+  versions: string[];
+}
+
+export interface ReleaseAnnouncement {
+  logRevision: string;
+  date: string;
+  list: string[];
 }
 
 export interface ReleaseRecord {

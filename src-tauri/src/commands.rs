@@ -48,6 +48,9 @@ pub struct ReleaseConfig {
     pub ignore_paths: Vec<String>,
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
+    /// 缺省自动识别，空字符串关闭同步，其他值为项目内的相对路径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_log_path: Option<String>,
 }
 
 fn default_output_dir() -> String {

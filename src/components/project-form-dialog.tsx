@@ -61,6 +61,8 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
   const [releaseNode, setReleaseNode] = useState("");
   const [releaseScript, setReleaseScript] = useState("build:prod");
   const [releaseOutputDir, setReleaseOutputDir] = useState("dist");
+  const [versionLogMode, setVersionLogMode] = useState<"auto" | "off" | "custom">("auto");
+  const [versionLogPath, setVersionLogPath] = useState("");
   /** 预检额外忽略，一行一个。.env.development 始终忽略 */
   const [releaseIgnore, setReleaseIgnore] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -84,6 +86,9 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
       setReleaseNode(initial?.release?.nodeVersion ?? "");
       setReleaseScript(initial?.release?.script ?? "build:prod");
       setReleaseOutputDir(initial?.release?.outputDir ?? "dist");
+      const logPath = initial?.release?.versionLogPath;
+      setVersionLogMode(logPath === undefined ? "auto" : logPath === "" ? "off" : "custom");
+      setVersionLogPath(logPath ?? "");
       setReleaseIgnore((initial?.release?.ignorePaths ?? []).join("\n"));
     }
   }, [open, initial]);
@@ -156,6 +161,15 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
         toast.error("产物目录须为项目下的相对路径，例如 dist 或 .output/public");
         return;
       }
+      const logPath = versionLogPath.trim().replace(/\\/g, "/");
+      if (versionLogMode === "custom" && (
+        !logPath.toLowerCase().endsWith(".json") ||
+        logPath.split("/").some((part) => !part || part === "." || part === ".." || /[<>:"|?*\u0000-\u001f]/.test(part) || /[. ]$/.test(part)) ||
+        logPath.toLowerCase() === "package.json"
+      )) {
+        toast.error("请输入项目内的版本日志 JSON 路径，例如 src/config/versionLog.json");
+        return;
+      }
       const ignorePaths = releaseIgnore
         .split(/[\n,]/)
         .map((s) => s.trim())
@@ -172,6 +186,7 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
         nodeVersion: releaseNode.trim(),
         script: releaseScript.trim(),
         outputDir,
+        ...(versionLogMode !== "auto" ? { versionLogPath: versionLogMode === "off" ? "" : logPath } : {}),
         ...(ignorePaths.length > 0 ? { ignorePaths } : {}),
       };
     }
@@ -401,6 +416,20 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
                   <Label htmlFor="release-output-dir">产物目录</Label>
                   <Input id="release-output-dir" value={releaseOutputDir} onChange={(e) => setReleaseOutputDir(e.currentTarget.value)} placeholder="dist" />
                   <p className="text-xs text-muted-foreground">相对于项目目录。构建完成后检查新产物，ZIP 保存在此目录。</p>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="release-version-log-mode">发布公告</Label>
+                  <Select value={versionLogMode} onValueChange={(value) => setVersionLogMode(value as typeof versionLogMode)}>
+                    <SelectTrigger id="release-version-log-mode" className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="auto">自动识别 src/config/versionLog.json</SelectItem>
+                      <SelectItem value="custom">指定版本日志</SelectItem>
+                      <SelectItem value="off">关闭同步</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {versionLogMode === "custom" && (
+                    <Input aria-label="版本日志相对路径" value={versionLogPath} onChange={(e) => setVersionLogPath(e.currentTarget.value)} placeholder="src/config/versionLog.json" />
+                  )}
                 </div>
                 <p className="text-xs text-muted-foreground">
                   发布前检查 Git 工作区。指定的 Node 版本仅用于本次构建子进程，版本更新需自行提交。

@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
-import type { Project, RunStatus } from "@/types";
+import type { Project, ReleaseAnnouncement, RunStatus } from "@/types";
 import { useProjectsStore } from "@/stores/projects";
 import { parseDevelopmentAddress, portAddress, stripAnsi, type AddressCandidate } from "@/lib/project-address";
 
@@ -187,6 +187,7 @@ interface RuntimeStore {
     project: Project,
     newVersion: string,
     expectedVersion: string,
+    announcement?: ReleaseAnnouncement,
   ) => Promise<void>;
 }
 
@@ -574,7 +575,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
     }
   },
 
-  startRelease: async (project, newVersion, expectedVersion) => {
+  startRelease: async (project, newVersion, expectedVersion, announcement) => {
     if (!project.release) {
       toast.error("该项目未配置发布参数，请先在编辑里填写");
       return;
@@ -587,7 +588,7 @@ export const useRuntimeStore = create<RuntimeStore>((set, get) => ({
       },
     }));
     try {
-      await invoke("start_release", { project, newVersion, expectedVersion });
+      await invoke("start_release", { project, newVersion, expectedVersion, announcement });
     } catch (e) {
       set((s) => ({
         releaseRuns: {

@@ -18,7 +18,14 @@ use crate::process_manager::CREATE_NO_WINDOW;
 use crate::process_manager::{
     compact_log_file, emit_tool_log, spawn_pipe_readers, validate_package_manager,
 };
+use crate::release_announcements::{
+    normalize_version_log_path, version_log_at_ref, ReleaseAnnouncement, VersionLogPreview,
+};
 use crate::release_artifacts::{select_artifacts, snapshot, validate_output_dir, write_archive};
+use crate::release_files::{
+    package_version, read_regular_file, update_package_version, with_release_file_edits,
+    PipelineError, ReleaseFileEdit,
+};
 use crate::release_history::{create_history_log, save_record, ReleaseRecord};
 use crate::release_node::{build_command, resolve_node, validate_node_version};
 
@@ -42,9 +49,6 @@ struct ReleaseFinishedEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
-
-/// 流水线错误：失败步骤 + 人话原因
-type PipelineError = (&'static str, String);
 
 /// deflate 压缩级别。实测（本仓库 dist，777 KB 前端产物）：
 /// miniz_oxide level 6 = 399,156 字节 / level 9 = 397,360，NanaZip -mx9 = 392,117。
@@ -77,7 +81,7 @@ fn ratio(raw_bytes: u64, packed: u64) -> String {
 /// 发布弹窗的上下文：一次 invoke 取回，避免多次调用之间状态漂移
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct ReleaseContext {
+pub(crate) struct ReleaseContext {
     /// 发布基准：发布分支上已提交的 package.json 版本
     pub release_version: String,
     /// 实际取到基准的引用（本地分支名，或回退的 origin/<分支>）
@@ -95,16 +99,19 @@ pub struct ReleaseContext {
     /// pnpm-workspace.yaml 的差异只有 allowBuilds 块
     pub allow_builds_ignored: bool,
     pub allow_builds_changes: Vec<AllowBuildsChange>,
+    pub release_date: String,
+    pub version_log: Option<VersionLogPreview>,
 }
 
 /// 读发布弹窗需要的上下文（FR-20）：发布分支的版本基准 + 当前工作区状态。
 /// 基准走 `git show <分支>:package.json`——工作区可能检出了别的分支、
 /// 或上次发布后版本号还没提交，读工作区文件会拿到错误的基准。
 #[tauri::command]
-pub fn read_release_context(
+pub(crate) fn read_release_context(
     path: String,
     branch: String,
     ignore_paths: Option<Vec<String>>,
+    version_log_path: Option<String>,
 ) -> Result<ReleaseContext, String> {
     let dir = Path::new(&path);
     if !is_safe_token(&branch, true) {
@@ -121,7 +128,7 @@ pub fn read_release_context(
         let (ok, out, err) = run_capture(dir, &format!("git show {reference}:./package.json"))
             .map_err(|e| format!("执行 git show 失败: {e}"))?;
         if ok {
-            found = Some((reference, parse_version(&out)?));
+            found = Some((reference, package_version(&out)?));
             break;
         }
         last_err = err.trim().to_string();
@@ -134,17 +141,24 @@ pub fn read_release_context(
     })?;
 
     let ws = workspace_status(dir, ignore_paths.as_deref().unwrap_or(&[]))?;
+    let version_log = version_log_at_ref(dir, &release_ref, version_log_path.as_deref())?
+        .map(|source| source.preview())
+        .transpose()?;
 
     Ok(ReleaseContext {
         release_version,
         release_ref,
         current_branch: git_head(dir).ok().flatten(),
-        working_version: read_package_version_at(&dir.join("package.json")).ok(),
+        working_version: read_regular_file(&dir.join("package.json"))
+            .and_then(|content| package_version(&content))
+            .ok(),
         dirty: !ws.blocking.is_empty(),
         blocking: ws.blocking,
         ignored: ws.ignored,
         allow_builds_ignored: ws.allow_builds_ignored,
         allow_builds_changes: ws.allow_builds_changes,
+        release_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+        version_log,
     })
 }
 
@@ -181,6 +195,7 @@ pub(crate) fn start_release(
     project: Project,
     new_version: String,
     expected_version: String,
+    announcement: Option<ReleaseAnnouncement>,
 ) -> Result<(), String> {
     let config = project.release.clone().ok_or("该项目未配置发布参数")?;
     let new_version = new_version.trim().to_owned();
@@ -192,7 +207,14 @@ pub(crate) fn start_release(
     let spawned = thread::Builder::new()
         .name("local-release".into())
         .spawn(move || {
-            execute_release(worker_app, project, config, new_version, expected_version);
+            execute_release(
+                worker_app,
+                project,
+                config,
+                new_version,
+                expected_version,
+                announcement,
+            );
         });
     if let Err(error) = spawned {
         app.state::<ReleaseManager>().finish();
@@ -224,6 +246,13 @@ fn validate_release(
         return Err("缺少发布基准版本，请重新检查".into());
     }
     validate_output_dir(&config.output_dir)?;
+    if let Some(path) = config
+        .version_log_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+    {
+        normalize_version_log_path(path)?;
+    }
     Ok(())
 }
 
@@ -244,6 +273,7 @@ fn execute_release(
     config: ReleaseConfig,
     version: String,
     expected: String,
+    announcement: Option<ReleaseAnnouncement>,
 ) {
     compact_log_file(&app, &project.id);
     let started = Instant::now();
@@ -256,14 +286,23 @@ fn execute_release(
         commit: None,
     };
     let result = match history_log.as_ref() {
-        Ok(_) => run_pipeline(&mut task, &config, &version, &expected),
+        Ok(_) => run_pipeline(
+            &mut task,
+            &config,
+            &version,
+            &expected,
+            announcement.as_ref(),
+        ),
         Err(error) => Err(("precheck", error.clone())),
     };
     match result {
         Ok(zip) => {
-            task.log(&format!(
-                "发布完成，package.json 版本已更新为 {version}，请按需提交"
-            ));
+            let files = if announcement.is_some() {
+                "版本号和更新公告"
+            } else {
+                "package.json 版本号"
+            };
+            task.log(&format!("发布完成，{files}已同步为 {version}，请按需提交"));
             record.success = true;
             record.zip_path = Some(zip);
         }
@@ -369,6 +408,7 @@ fn run_pipeline(
     config: &ReleaseConfig,
     version: &str,
     expected: &str,
+    announcement: Option<&ReleaseAnnouncement>,
 ) -> Result<String, PipelineError> {
     let dir = Path::new(&task.project.path);
     task.step("precheck", "running", None);
@@ -414,41 +454,56 @@ fn run_pipeline(
     );
 
     task.step("bump", "running", None);
-    let package = dir.join("package.json");
-    let actual = read_package_version_at(&package).map_err(|e| ("bump", e))?;
-    if actual != expected {
-        return Err((
+    let edits = prepare_release_edits(
+        dir,
+        config.version_log_path.as_deref(),
+        version,
+        expected,
+        announcement,
+    )
+    .map_err(|error| ("bump", error))?;
+    with_release_file_edits(&edits, || {
+        let details = if announcement.is_some() {
+            " · 已同步公告"
+        } else {
+            ""
+        };
+        task.step(
             "bump",
-            format!("发布版本基准已变化：确认时为 {expected}，当前为 {actual}。请重新检查"),
-        ));
-    }
-    let old_version = write_package_version(&package, version).map_err(|e| ("bump", e))?;
-    task.step(
-        "bump",
-        "success",
-        Some(format!("{old_version} → {version}")),
-    );
-
-    let outcome = build_and_package(task, config, version, &mut build, dir);
-    if let Err((step, mut error)) = outcome {
-        match restore_package_version(&package, version, &old_version) {
-            Ok(()) => error.push_str("；package.json 版本已恢复"),
-            Err(restore) => error.push_str(&format!("；恢复版本失败: {restore}")),
-        }
-        return Err((step, error));
-    }
-    outcome
+            "success",
+            Some(format!("{expected} → {version}{details}")),
+        );
+        build_and_package(task, config, version, &mut build, dir)
+    })
 }
 
-fn restore_package_version(path: &Path, written: &str, original: &str) -> Result<(), String> {
-    let current = read_package_version_at(path)?;
-    if current == original {
-        return Ok(());
+fn prepare_release_edits(
+    dir: &Path,
+    configured_log: Option<&str>,
+    version: &str,
+    expected: &str,
+    announcement: Option<&ReleaseAnnouncement>,
+) -> Result<Vec<ReleaseFileEdit>, String> {
+    let package = dir.join("package.json");
+    let original = read_regular_file(&package)?;
+    let actual = package_version(&original)?;
+    if actual != expected {
+        return Err(format!(
+            "发布版本基准已变化，确认时为 {expected}，当前为 {actual}。请重新检查"
+        ));
     }
-    if current != written {
-        return Err(format!("版本已改为 {current}，请检查 package.json"));
+    let updated = update_package_version(&original, version)?;
+    let mut edits = vec![ReleaseFileEdit::new(package, original, updated)];
+    match (
+        version_log_at_ref(dir, "HEAD", configured_log)?,
+        announcement,
+    ) {
+        (Some(source), Some(draft)) => edits.push(source.prepare_edit(dir, version, draft)?),
+        (Some(_), None) => return Err("请先确认本次更新公告，再开始发布".into()),
+        (None, Some(_)) => return Err("发布分支的版本日志配置已变化，请重新检查".into()),
+        (None, None) => {}
     }
-    write_package_version(path, original).map(|_| ())
+    Ok(edits)
 }
 
 fn build_and_package(
@@ -523,80 +578,6 @@ fn run_capture(cwd: &Path, command: &str) -> Result<(bool, String, String), Stri
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
     ))
-}
-
-/// 从 package.json 文本里取 version
-fn parse_version(content: &str) -> Result<String, String> {
-    let pkg: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("package.json 解析失败: {e}"))?;
-    pkg["version"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "package.json 缺少 version 字段".into())
-}
-
-/// 读某个 package.json 的 version（不改文件）
-fn read_package_version_at(pkg_path: &Path) -> Result<String, String> {
-    let content =
-        std::fs::read_to_string(pkg_path).map_err(|e| format!("读取 package.json 失败: {e}"))?;
-    parse_version(&content)
-}
-
-/// 当前分支。用 `git rev-parse` 而不是读 `.git/HEAD`：worktree 下 `.git` 是文件，
-/// 顺着路径找 HEAD 找不到；detached HEAD 时 `--abbrev-ref` 返回字面量 "HEAD"，
-/// 退化为短哈希。
-/// 把 package.json 的 version 改成 new_version。
-/// 用文本替换而不是反序列化写回：保持原文件的缩进、字段顺序等格式不被重排。
-/// 定位时容忍 `"version" : "1.2.3"` 这类冒号两侧的空白，且只替换值本身，
-/// 键周围的原始格式原样保留。
-fn write_package_version(pkg_path: &Path, new_version: &str) -> Result<String, String> {
-    let content =
-        std::fs::read_to_string(pkg_path).map_err(|e| format!("读取 package.json 失败: {e}"))?;
-    let old = parse_version(&content)?;
-
-    let key = "\"version\"";
-    let quoted_old = format!("\"{old}\"");
-    let bytes = content.as_bytes();
-    let mut from = 0;
-    while let Some(offset) = content[from..].find(key) {
-        let key_at = from + offset;
-        let mut i = key_at + key.len();
-        // 键与冒号之间、冒号与值之间的空白都跳过
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b':' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if content[i..].starts_with(&quoted_old) {
-                let replaced = format!(
-                    "{}\"{new_version}\"{}",
-                    &content[..i],
-                    &content[i + quoted_old.len()..],
-                );
-                write_package_atomically(pkg_path, replaced.as_bytes())?;
-                return Ok(old);
-            }
-        }
-        // 这里不是 version 键值对（如字符串值里恰好含 "version"），继续往后找
-        from = key_at + key.len();
-    }
-    Err("在 package.json 中找不到 version 字段（格式异常）".into())
-}
-
-fn write_package_atomically(path: &Path, content: &[u8]) -> Result<(), String> {
-    let temporary = path.with_extension("json.fpm-version.tmp");
-    let mut file = std::fs::File::create_new(&temporary)
-        .map_err(|error| format!("创建版本更新临时文件失败: {error}"))?;
-    let written = file.write_all(content).and_then(|_| file.sync_all());
-    drop(file);
-    let result = written.and_then(|_| std::fs::rename(&temporary, path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(|error| format!("写入 package.json 失败: {error}"))
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1001,6 +982,107 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn write_package_version(path: &Path, version: &str) -> Result<String, String> {
+        let original = read_regular_file(path)?;
+        let previous = package_version(&original)?;
+        let updated = update_package_version(&original, version)?;
+        let edit = ReleaseFileEdit::new(path.to_path_buf(), original, updated);
+        with_release_file_edits(&[edit], || Ok(previous)).map_err(|(_, error)| error)
+    }
+
+    #[test]
+    fn bump_updates_only_the_top_level_version_even_when_a_nested_value_matches() {
+        let path = std::env::temp_dir().join(format!(
+            "fpm-package-version-{}.json",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original =
+            "{\r\n  \"metadata\": {\"version\": \"1.0.54\"},\r\n  \"version\": \"1.0.54\"\r\n}";
+        fs::write(&path, original).unwrap();
+        assert_eq!(write_package_version(&path, "1.0.55").unwrap(), "1.0.54");
+        let actual = fs::read_to_string(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            actual,
+            original.replace(
+                "  \"version\": \"1.0.54\"\r\n",
+                "  \"version\": \"1.0.55\"\r\n"
+            )
+        );
+    }
+
+    #[test]
+    fn applies_both_release_files_and_restores_them_on_build_or_write_failure() {
+        let repo = std::env::temp_dir().join(format!(
+            "fpm-announcement-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(repo.join("src/config")).unwrap();
+        let package = repo.join("package.json");
+        let log = repo.join("src/config/versionLog.json");
+        let original_package = "{\n  \"version\": \"1.0.54\"\n}";
+        let original_log = r#"[{"version":"1.0.54","date":"2026-11-24","list":["旧公告"]}]"#;
+        fs::write(&package, original_package).unwrap();
+        fs::write(&log, original_log).unwrap();
+        for command in ["git init -q -b master", "git add -A", "git -c user.name=test -c user.email=test@example.test -c commit.gpgsign=false commit -qm initial"] {
+            let (ok, _, error) = run_capture(&repo, command).unwrap();
+            assert!(ok, "{command}: {error}");
+        }
+        let context = read_release_context(
+            repo.to_string_lossy().into_owned(),
+            "master".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let preview = serde_json::to_value(context.version_log.unwrap()).unwrap();
+        assert_eq!(preview["latest"]["version"], "1.0.54");
+        assert_eq!(
+            prepare_release_edits(&repo, Some(""), "1.0.55", "1.0.54", None)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut draft = ReleaseAnnouncement {
+            log_revision: "stale".into(),
+            date: "2026-11-25".into(),
+            list: vec!["修正日期".into()],
+        };
+        assert!(prepare_release_edits(&repo, None, "1.0.55", "1.0.54", Some(&draft)).is_err());
+        draft.log_revision = preview["revision"].as_str().unwrap().into();
+        let edits = prepare_release_edits(&repo, None, "1.0.55", "1.0.54", Some(&draft)).unwrap();
+        let error = with_release_file_edits(&edits, || {
+            assert_eq!(
+                package_version(&fs::read_to_string(&package).unwrap()).unwrap(),
+                "1.0.55"
+            );
+            let contents: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&log).unwrap()).unwrap();
+            assert_eq!(contents[1]["version"], "1.0.55");
+            assert_eq!(contents[1]["list"][0], "修正日期");
+            Err::<(), _>(("build", "构建失败".into()))
+        })
+        .unwrap_err();
+        assert_eq!(error.0, "build");
+        assert_eq!(fs::read_to_string(&package).unwrap(), original_package);
+        assert_eq!(fs::read_to_string(&log).unwrap(), original_log);
+
+        fs::write(
+            log.with_file_name("versionLog.json.fpm-release.tmp"),
+            "已有的临时文件",
+        )
+        .unwrap();
+        let error = with_release_file_edits::<()>(&edits, || panic!("写入失败后不能构建"))
+            .unwrap_err();
+        assert_eq!(error.0, "bump");
+        assert_eq!(fs::read_to_string(&package).unwrap(), original_package);
+        assert_eq!(fs::read_to_string(&log).unwrap(), original_log);
+        fs::remove_dir_all(repo).unwrap();
+    }
+
     #[test]
     fn bump_replaces_version_preserving_format() {
         let path = std::env::temp_dir().join(format!(
@@ -1114,9 +1196,12 @@ mod tests {
     /// 缺少 version 字段时报错而不是 panic（发布基准读不出来要中止）
     #[test]
     fn parse_version_rejects_missing_field() {
-        assert_eq!(parse_version("{\"version\": \"1.0.0\"}").unwrap(), "1.0.0");
-        assert!(parse_version("{\"name\": \"demo\"}").is_err());
-        assert!(parse_version("not json").is_err());
+        assert_eq!(
+            package_version("{\"version\": \"1.0.0\"}").unwrap(),
+            "1.0.0"
+        );
+        assert!(package_version("{\"name\": \"demo\"}").is_err());
+        assert!(package_version("not json").is_err());
     }
 
     /// 版本基准必须来自发布分支的已提交内容，而不是工作区当前检出的那份。
@@ -1157,7 +1242,7 @@ mod tests {
         git("commit -q -m bump-on-feature");
 
         let path = repo.to_string_lossy().to_string();
-        let ctx = read_release_context(path.clone(), "master".to_string(), None).unwrap();
+        let ctx = read_release_context(path.clone(), "master".to_string(), None, None).unwrap();
         assert_eq!(ctx.release_version, "1.4.0", "基准应取发布分支的已提交版本");
         assert_eq!(ctx.release_ref, "master");
         assert_eq!(ctx.current_branch.as_deref(), Some("feature"));
@@ -1166,7 +1251,7 @@ mod tests {
 
         // 工作区脏（上次发布后版本号没提交）也能读出来，供弹窗提示
         fs::write(repo.join("package.json"), "{\"version\": \"2.1.1\"}").unwrap();
-        let ctx = read_release_context(path, "master".to_string(), None).unwrap();
+        let ctx = read_release_context(path, "master".to_string(), None, None).unwrap();
         assert_eq!(ctx.release_version, "1.4.0", "脏工作区不影响基准");
         assert_eq!(ctx.working_version.as_deref(), Some("2.1.1"));
         assert!(ctx.dirty);

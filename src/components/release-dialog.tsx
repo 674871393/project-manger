@@ -46,6 +46,11 @@ interface Props {
 
 type BumpKind = "patch" | "minor" | "major" | "custom";
 
+interface AnnouncementDraft {
+  date: string;
+  notes: string;
+}
+
 const STEP_LABELS: { key: ReleaseStep; label: string }[] = [
   { key: "precheck", label: "预检（工作区干净）" },
   { key: "node", label: "准备构建使用的 Node" },
@@ -101,6 +106,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
   const [ctxError, setCtxError] = useState<string | null>(null);
   const [bump, setBump] = useState<BumpKind>("patch");
   const [customVersion, setCustomVersion] = useState("");
+  const [announcementDrafts, setAnnouncementDrafts] = useState<Record<string, AnnouncementDraft>>({});
   /** 是否已点过「开始发布」（控制弹窗处于配置态还是进度态） */
   const [started, setStarted] = useState(false);
   const contextRequest = useRef(0);
@@ -117,6 +123,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
       path: project.path,
       branch: project.release.branch,
       ignorePaths: project.release.ignorePaths ?? [],
+      versionLogPath: project.release.versionLogPath,
     })
       .then((c) => {
         if (contextRequest.current !== request) return;
@@ -136,6 +143,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
     setStarted(false);
     setBump("patch");
     setCustomVersion("");
+    setAnnouncementDrafts({});
     loadContext();
     return () => { contextRequest.current++; };
   }, [open, project, loadContext]);
@@ -151,17 +159,36 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
         ? bumpVersion(ctx.releaseVersion, bump)
         : "";
   const blocking = ctx?.blocking ?? [];
+  const versionLog = ctx?.versionLog;
+  const existing = versionLog?.latest?.version === newVersion ? versionLog.latest : null;
+  const archivedVersion = !existing && versionLog?.versions.includes(newVersion);
+  const draftKey = versionLog?.revision + "/" + newVersion;
+  const draft = announcementDrafts[draftKey] ?? {
+    date: existing?.date ?? ctx?.releaseDate ?? "",
+    notes: existing?.list.join("\n") ?? "",
+  };
+  const announcementLines = draft.notes.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const announcementReady = !versionLog || Boolean(draft.date && announcementLines.length && !archivedVersion);
   const canStart =
     newVersion.length > 0 &&
     VERSION_RE.test(newVersion) &&
     ctx !== null &&
     blocking.length === 0 &&
-    !run?.running && !anotherRelease;
+    !run?.running && !anotherRelease && announcementReady;
+
+  function updateAnnouncement(patch: Partial<AnnouncementDraft>) {
+    setAnnouncementDrafts((drafts) => ({ ...drafts, [draftKey]: { ...draft, ...patch } }));
+  }
 
   function handleStart() {
     if (!project || !canStart || !ctx) return;
     setStarted(true);
-    startRelease(project, newVersion, ctx.releaseVersion);
+    const announcement = versionLog ? {
+      date: draft.date,
+      list: announcementLines,
+      logRevision: versionLog.revision,
+    } : undefined;
+    void startRelease(project, newVersion, ctx.releaseVersion, announcement);
   }
 
   return (
@@ -190,7 +217,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
                       run.steps[key] === "running" ? "font-medium" : "text-muted-foreground"
                     }
                   >
-                    {label}
+                    {key === "bump" && versionLog ? "同步版本和公告" : label}
                   </span>
                   {run.messages[key] && (
                     <span className="ml-auto truncate text-xs text-muted-foreground">
@@ -216,7 +243,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
                 下次发布会被预检拦下，用户会莫名其妙 */}
             {run.zipPath && !run.running && (
               <p className="rounded-md bg-yellow-500/10 p-2 text-xs text-yellow-700 dark:text-yellow-400">
-                package.json 版本号已更新且未提交，请记得 commit——工作区不干净时下次发布会被预检拦下
+                {versionLog ? "版本号和更新公告已同步。请按需提交发布变更。" : "package.json 版本号已更新。请按需提交发布变更。"}
               </p>
             )}
 
@@ -308,6 +335,36 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
                   <span className="font-mono text-foreground">{newVersion}</span>
                 </p>
               )
+            )}
+
+            {versionLog && (
+              <div className="grid gap-3 rounded-md border p-3">
+                <div>
+                  <h3 className="text-sm font-medium">更新公告</h3>
+                  <p className="break-all font-mono text-xs text-muted-foreground">{versionLog.path}</p>
+                </div>
+                {archivedVersion ? (
+                  <p role="alert" className="text-xs text-destructive">此版本已有历史公告，请选择新版本。</p>
+                ) : (
+                  <>
+                    <p className="text-xs text-muted-foreground">
+                      {existing ? "已载入同版本公告，可以直接复用或修改。" : "构建前会追加本次公告。"}
+                      {newVersion && " 版本 " + newVersion}
+                    </p>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="release-announcement-date">发布日期</Label>
+                      <Input id="release-announcement-date" type="date" value={draft.date} onChange={(event) => updateAnnouncement({ date: event.currentTarget.value })} />
+                    </div>
+                    <div className="grid gap-1.5">
+                      <Label htmlFor="release-announcement-notes">更新内容</Label>
+                      <textarea id="release-announcement-notes" rows={3} value={draft.notes}
+                        onChange={(event) => updateAnnouncement({ notes: event.currentTarget.value })}
+                        placeholder="每行一条，例如：优化报销审批日期筛选"
+                        className="w-full rounded-lg border border-input bg-transparent px-2.5 py-1.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" />
+                    </div>
+                  </>
+                )}
+              </div>
             )}
 
             {/* 基准来自发布分支已提交的 package.json，与工作区当前检出/改了一半的
