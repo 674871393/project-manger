@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FolderSearch, Plus, RefreshCw, Search, Settings, X } from "lucide-react";
+import { Activity, FolderSearch, History, Layers, Plus, RefreshCw, Search, Settings, X } from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +14,9 @@ import { ScanImportDialog } from "@/components/scan-import-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { InstallConfirmDialog } from "@/components/install-confirm-dialog";
 import { ReleaseDialog } from "@/components/release-dialog";
+import { LaunchPlansDialog } from "@/components/launch-plans-dialog";
+import { ProjectDiagnosticsSheet } from "@/components/project-diagnostics-sheet";
+import { ReleaseHistorySheet } from "@/components/release-history-sheet";
 import type { Project } from "@/types";
 import { useProjectsStore } from "@/stores/projects";
 import { useRuntimeStore } from "@/stores/runtime";
@@ -34,12 +38,15 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [releaseProject, setReleaseProject] = useState<Project | null>(null);
   const [releaseOpen, setReleaseOpen] = useState(false);
+  const [plansOpen, setPlansOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnosticsProject, setDiagnosticsProject] = useState<Project | null>(null);
 
   useEffect(() => {
-    load();
-    initListeners();
-    loadLanIp();
-    syncFromBackend();
+    void Promise.all([load(), initListeners()]).then(syncFromBackend)
+      .catch((error) => toast.error("初始化进程事件失败: " + error));
+    void loadLanIp();
   }, [load, initListeners, loadLanIp, syncFromBackend]);
 
   // 进程意外退出 → 自动弹出该项目的日志抽屉（PRD 4.3）
@@ -99,19 +106,24 @@ function App() {
     setFormOpen(true);
   }
 
+  function openDiagnostics(project: Project | null) {
+    setDiagnosticsProject(project);
+    setDiagnosticsOpen(true);
+  }
+
   return (
     <TooltipProvider>
       <div className="flex h-screen flex-col">
-        <header className="flex items-center justify-between gap-4 border-b px-4 py-2">
-          <h1 className="text-sm font-semibold">前端项目管理器</h1>
-          <div className="flex items-center gap-2">
+        <header className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2">
+          <h1 className="shrink-0 text-sm font-semibold">前端项目管理器</h1>
+          <div className="flex flex-wrap items-center gap-2">
             <div className="relative">
               <Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
                 value={search}
                 onChange={(e) => setSearch(e.currentTarget.value)}
                 placeholder="搜索项目…"
-                className="w-56 pr-8 pl-8"
+                className="w-36 pr-8 pl-8 xl:w-48"
               />
               {search && (
                 <button
@@ -146,6 +158,9 @@ function App() {
               <Plus />
               添加项目
             </Button>
+            <Button variant="outline" size="sm" onClick={() => setPlansOpen(true)}><Layers />启动方案</Button>
+            <Button variant="outline" size="icon-sm" onClick={() => setHistoryOpen(true)} title="发布历史" aria-label="发布历史"><History /></Button>
+            <Button variant="outline" size="icon-sm" onClick={() => openDiagnostics(null)} title="端口总览" aria-label="端口总览"><Activity /></Button>
             <Button
               variant="outline"
               size="icon-sm"
@@ -173,6 +188,7 @@ function App() {
               projects={filtered}
               branches={branches}
               onEdit={openEdit}
+              onDiagnose={openDiagnostics}
               onOpenLogs={(p) => {
                 setLogProject(p);
                 setLogOpen(true);
@@ -194,6 +210,9 @@ function App() {
       <ScanImportDialog open={scanOpen} onOpenChange={setScanOpen} />
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
       <InstallConfirmDialog />
+      <LaunchPlansDialog projects={projects} open={plansOpen} onOpenChange={setPlansOpen} />
+      <ReleaseHistorySheet open={historyOpen} onOpenChange={setHistoryOpen} />
+      <ProjectDiagnosticsSheet project={diagnosticsProject} projects={projects} open={diagnosticsOpen} onOpenChange={setDiagnosticsOpen} />
       <ReleaseDialog
         project={releaseProject}
         open={releaseOpen}

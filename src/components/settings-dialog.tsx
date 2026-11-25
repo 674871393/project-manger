@@ -25,30 +25,38 @@ interface AppSettings {
   autostart: boolean;
 }
 
+interface SettingsView extends AppSettings {
+  autostartAvailable: boolean;
+}
+
 /** 设置弹窗：关闭行为 + 开机自启 + 版本号 */
 export function SettingsDialog({ open, onOpenChange }: Props) {
-  const [settings, setSettings] = useState<AppSettings>({
-    minimizeOnClose: false,
-    autostart: false,
-  });
+  const [settings, setSettings] = useState<SettingsView | null>(null);
+  const [saving, setSaving] = useState(false);
   const [version, setVersion] = useState("");
 
   useEffect(() => {
     if (!open) return;
-    invoke<AppSettings>("load_settings")
+    invoke<SettingsView>("load_settings")
       .then(setSettings)
       .catch((e) => toast.error(`读取设置失败: ${e}`));
     getVersion().then(setVersion).catch(() => setVersion("未知"));
   }, [open]);
 
   async function update(patch: Partial<AppSettings>) {
+    if (!settings || saving) return;
     const next = { ...settings, ...patch };
     setSettings(next); // 先改 UI，失败再回滚
+    setSaving(true);
     try {
-      await invoke("save_settings", { settings: next });
+      await invoke("save_settings", {
+        settings: { minimizeOnClose: next.minimizeOnClose, autostart: next.autostart },
+      });
     } catch (e) {
       setSettings(settings); // 回滚
       toast.error(`保存设置失败: ${e}`);
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -64,7 +72,8 @@ export function SettingsDialog({ open, onOpenChange }: Props) {
           <div className="grid gap-2">
             <Label>点击窗口关闭按钮（X）时</Label>
             <RadioGroup
-              value={settings.minimizeOnClose ? "minimize" : "exit"}
+              value={settings?.minimizeOnClose ? "minimize" : "exit"}
+              disabled={!settings || saving}
               onValueChange={(v) =>
                 update({ minimizeOnClose: v === "minimize" })
               }
@@ -95,11 +104,14 @@ export function SettingsDialog({ open, onOpenChange }: Props) {
             <div>
               <div className="text-sm font-medium">开机自启动</div>
               <div className="text-xs text-muted-foreground">
-                系统启动时自动运行本应用
+                {settings && !settings.autostartAvailable
+                  ? "开机自启可在正式版中设置"
+                  : "登录 Windows 后自动运行本应用"}
               </div>
             </div>
             <Switch
-              checked={settings.autostart}
+              checked={settings?.autostart ?? false}
+              disabled={!settings?.autostartAvailable || saving}
               onCheckedChange={(v) => update({ autostart: v })}
               aria-label="开机自启动"
             />

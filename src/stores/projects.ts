@@ -16,9 +16,27 @@ interface ProjectsState {
 
   load: () => Promise<void>;
   add: (project: Project) => Promise<void>;
+  addMany: (projects: Project[]) => Promise<void>;
   update: (project: Project) => Promise<void>;
-  remove: (id: string) => Promise<void>;
+  removeMany: (ids: string[]) => Promise<void>;
   refreshBranches: () => Promise<void>;
+}
+
+let pendingWrite = Promise.resolve();
+let pendingLoad: Promise<void> | undefined;
+
+function saveProjectList(change: (projects: Project[]) => Project[]): Promise<void> {
+  const save = pendingWrite.then(async () => {
+    const store = useProjectsStore.getState();
+    if (!store.loaded) throw new Error("请先加载项目列表");
+    const projects = change(store.projects);
+    await invoke("save_projects", { projects });
+    const currentBranches = useProjectsStore.getState().branches;
+    const branches = Object.fromEntries(projects.map(({ id }) => [id, currentBranches[id] ?? null]));
+    useProjectsStore.setState({ projects, branches });
+  });
+  pendingWrite = save.catch(() => {});
+  return save;
 }
 
 export const useProjectsStore = create<ProjectsState>((set, get) => ({
@@ -26,45 +44,39 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
   loaded: false,
   branches: {},
 
-  load: async () => {
-    try {
-      const projects = await invoke<Project[]>("load_projects");
-      set({ projects, loaded: true });
-      get().refreshBranches();
-    } catch (e) {
-      toast.error(`加载项目列表失败: ${e}`);
-    }
+  load: () => {
+    if (pendingLoad) return pendingLoad;
+    const load = pendingWrite.then(async () => {
+      try {
+        const projects = await invoke<Project[]>("load_projects");
+        set({ projects, loaded: true });
+        void get().refreshBranches();
+      } catch (e) {
+        toast.error(`加载项目列表失败: ${e}`);
+      }
+    });
+    pendingWrite = load;
+    pendingLoad = load.finally(() => { pendingLoad = undefined; });
+    return pendingLoad;
   },
 
-  add: async (project) => {
-    await invoke("save_projects", { projects: [...get().projects, project] });
-    set((s) => ({
-      projects: [...s.projects, project],
-      branches: { ...s.branches, [project.id]: null },
-    }));
-    get().refreshBranches();
+  add: (project) => get().addMany([project]),
+
+  addMany: async (added) => {
+    await saveProjectList((projects) => [...projects, ...added]);
+    void get().refreshBranches();
   },
 
   update: async (project) => {
-    await invoke("save_projects", {
-      projects: get().projects.map((p) => (p.id === project.id ? project : p)),
-    });
-    set((s) => ({
-      projects: s.projects.map((p) => (p.id === project.id ? project : p)),
-    }));
-    // 路径可能改了，重新读分支
-    get().refreshBranches();
+    await saveProjectList((projects) => projects.map((item) => item.id === project.id ? project : item));
+    void get().refreshBranches();
   },
 
-  remove: async (id) => {
-    await invoke("save_projects", {
-      projects: get().projects.filter((p) => p.id !== id),
-    });
-    set((s) => {
-      const branches = { ...s.branches };
-      delete branches[id];
-      return { projects: s.projects.filter((p) => p.id !== id), branches };
-    });
+  removeMany: async (ids) => {
+    const removed = new Set(ids);
+    if (removed.size === 0) return;
+    await saveProjectList((projects) => projects.filter(({ id }) => !removed.has(id)));
+    void get().refreshBranches();
   },
 
   refreshBranches: async () => {
@@ -81,6 +93,6 @@ export const useProjectsStore = create<ProjectsState>((set, get) => ({
         }
       }),
     );
-    set({ branches: Object.fromEntries(entries) });
+    if (get().projects === projects) set({ branches: Object.fromEntries(entries) });
   },
 }));

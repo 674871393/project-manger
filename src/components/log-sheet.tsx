@@ -23,7 +23,7 @@ import {
   SheetTitle,
 } from "@/components/ui/sheet";
 import type { Project } from "@/types";
-import { useRuntimeStore, type LogLine } from "@/stores/runtime";
+import { isActive, useRuntimeStore, type LogLine } from "@/stores/runtime";
 
 interface Props {
   project: Project | null;
@@ -109,7 +109,7 @@ export function LogSheet({ project, open, onOpenChange }: Props) {
   // 项目未运行且无内存日志 → 读回落盘的尾部历史（FR-10 跨会话日志）
   useEffect(() => {
     if (!open || !project) return;
-    if (status === "running" || status === "starting") return;
+    if (isActive(status)) return;
     if ((useRuntimeStore.getState().logs[project.id] ?? []).length > 0) return;
     let cancelled = false;
     invoke<string[]>("read_log_tail", {
@@ -188,7 +188,7 @@ export function LogSheet({ project, open, onOpenChange }: Props) {
         <SheetHeader className="border-b pr-12">
           <SheetTitle className="flex items-center gap-2">
             {project?.name}
-            {status === "running" ? (
+            {isActive(status) ? (
               <Badge className="border-transparent bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
                 运行中
               </Badge>
@@ -213,7 +213,7 @@ export function LogSheet({ project, open, onOpenChange }: Props) {
             ) : (
               <>
                 stdout + stderr 合并输出，共 {allLines.length} 行
-                {status !== "running" && "（项目未运行）"}
+                {!isActive(status) && "（项目未运行）"}
               </>
             )}
           </SheetDescription>
@@ -257,7 +257,7 @@ export function LogSheet({ project, open, onOpenChange }: Props) {
             <div className="flex h-full items-center justify-center text-muted-foreground">
               {q
                 ? `没有匹配「${query.trim()}」的日志行`
-                : status === "running" || status === "starting"
+                : isActive(status)
                   ? "等待输出…"
                   : "暂无日志"}
             </div>

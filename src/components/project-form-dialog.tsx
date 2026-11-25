@@ -60,6 +60,9 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
   const [releaseBranch, setReleaseBranch] = useState("");
   const [releaseNode, setReleaseNode] = useState("");
   const [releaseScript, setReleaseScript] = useState("build:prod");
+  const [releaseOutputDir, setReleaseOutputDir] = useState("dist");
+  /** 预检额外忽略，一行一个。.env.development 始终忽略 */
+  const [releaseIgnore, setReleaseIgnore] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   // 打开时用 initial 重置表单
@@ -80,6 +83,8 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
       setReleaseBranch(initial?.release?.branch ?? "");
       setReleaseNode(initial?.release?.nodeVersion ?? "");
       setReleaseScript(initial?.release?.script ?? "build:prod");
+      setReleaseOutputDir(initial?.release?.outputDir ?? "dist");
+      setReleaseIgnore((initial?.release?.ignorePaths ?? []).join("\n"));
     }
   }, [open, initial]);
 
@@ -137,7 +142,7 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
         toast.error("发布分支含非法字符（仅允许字母数字与 - _ . /）");
         return;
       }
-      if (!/^[\w\-.:+@]+$/.test(releaseNode.trim())) {
+      if (!/^\d+\.\d+\.\d+$/.test(releaseNode.trim())) {
         toast.error("node 版本含非法字符（应为形如 16.20.0 的完整版本号）");
         return;
       }
@@ -145,10 +150,29 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
         toast.error("构建脚本名含非法字符（仅允许字母数字与 - _ . : @ +）");
         return;
       }
+      const outputDir = releaseOutputDir.trim() || "dist";
+      const parts = outputDir.replace(/\\/g, "/").split("/");
+      if (parts.some((part) => !part || /[<>:"|?*]/.test(part) || /[. ]$/.test(part))) {
+        toast.error("产物目录须为项目下的相对路径，例如 dist 或 .output/public");
+        return;
+      }
+      const ignorePaths = releaseIgnore
+        .split(/[\n,]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const tooBroad = ignorePaths.find((p) =>
+        ["*", "**", "**/*", "**/**"].includes(p.replace(/\\/g, "/")),
+      );
+      if (tooBroad) {
+        toast.error(`忽略规则「${tooBroad}」会放过所有文件，请改成具体路径`);
+        return;
+      }
       release = {
         branch: releaseBranch.trim(),
         nodeVersion: releaseNode.trim(),
         script: releaseScript.trim(),
+        outputDir,
+        ...(ignorePaths.length > 0 ? { ignorePaths } : {}),
       };
     }
 
@@ -373,10 +397,29 @@ export function ProjectFormDialog({ initial, open, onOpenChange }: Props) {
                     placeholder="package.json scripts 里的脚本名，如 build:prod"
                   />
                 </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="release-output-dir">产物目录</Label>
+                  <Input id="release-output-dir" value={releaseOutputDir} onChange={(e) => setReleaseOutputDir(e.currentTarget.value)} placeholder="dist" />
+                  <p className="text-xs text-muted-foreground">相对于项目目录。构建完成后检查新产物，ZIP 保存在此目录。</p>
+                </div>
                 <p className="text-xs text-muted-foreground">
-                  发布前要求 git 工作区干净（有未提交变更会中止）；结束后自动切回原 node
-                  版本。仅本机打包，不自动 commit / push。
+                  发布前检查 Git 工作区。指定的 Node 版本仅用于本次构建子进程，版本更新需自行提交。
                 </p>
+                <div className="grid gap-2">
+                  <Label htmlFor="release-ignore">预检忽略的文件</Label>
+                  <textarea
+                    id="release-ignore"
+                    value={releaseIgnore}
+                    onChange={(e) => setReleaseIgnore(e.currentTarget.value)}
+                    placeholder={"每行一个，如\n.env.local\n*.local"}
+                    rows={3}
+                    className="w-full rounded-lg border border-input bg-transparent px-2.5 py-1.5 font-mono text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    .env.development 始终忽略。pnpm-workspace.yaml 若只有 allowBuilds
+                    变化，发布弹窗会显示差异，规则保留在项目配置中。
+                  </p>
+                </div>
               </div>
             )}
           </div>

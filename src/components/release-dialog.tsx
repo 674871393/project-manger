@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
@@ -48,16 +48,15 @@ type BumpKind = "patch" | "minor" | "major" | "custom";
 
 const STEP_LABELS: { key: ReleaseStep; label: string }[] = [
   { key: "precheck", label: "预检（工作区干净）" },
+  { key: "node", label: "准备构建使用的 Node" },
   { key: "checkout", label: "切换发布分支" },
-  { key: "node", label: "切换 node 版本" },
   { key: "bump", label: "升版本号" },
   { key: "build", label: "执行构建" },
   { key: "zip", label: "压缩产物" },
-  { key: "restore", label: "恢复 node 版本" },
 ];
 
 /** 版本号字符白名单（与 Rust start_release 的校验一致，`cmd /C` 拼接安全） */
-const VERSION_RE = /^[\w.\-+]+$/;
+const VERSION_RE = /^\d(?:[A-Za-z0-9.\-+]*[A-Za-z0-9])?$/;
 
 /** 版本号 +1（PRD FR-20）：
  * patch = 最后一段 +1，兼容任意段数（1.2.4 → 1.2.5，1.2.0.13 → 1.2.0.14）；
@@ -104,22 +103,28 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
   const [customVersion, setCustomVersion] = useState("");
   /** 是否已点过「开始发布」（控制弹窗处于配置态还是进度态） */
   const [started, setStarted] = useState(false);
+  const contextRequest = useRef(0);
+  const anotherRelease = Object.entries(releaseRuns).some(([id, state]) => id !== project?.id && state.running);
 
   /** 读发布基准与工作区状态。返回修改 / 重试后也要重读——
    *  基准可能已变化（流水线会因此中止），拿旧值重试只会再失败一次 */
   const loadContext = useCallback(() => {
     if (!project?.release) return;
+    const request = ++contextRequest.current;
     setCtx(null);
     setCtxError(null);
     invoke<ReleaseContext>("read_release_context", {
       path: project.path,
       branch: project.release.branch,
+      ignorePaths: project.release.ignorePaths ?? [],
     })
       .then((c) => {
+        if (contextRequest.current !== request) return;
         setCtx(c);
         setCtxError(null);
       })
       .catch((e) => {
+        if (contextRequest.current !== request) return;
         setCtx(null);
         setCtxError(String(e));
       });
@@ -132,6 +137,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
     setBump("patch");
     setCustomVersion("");
     loadContext();
+    return () => { contextRequest.current++; };
   }, [open, project, loadContext]);
 
   // 进度态：本次点过开始，或流水线还在跑。后者是「后台运行」关掉弹窗后
@@ -144,11 +150,13 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
       : ctx
         ? bumpVersion(ctx.releaseVersion, bump)
         : "";
+  const blocking = ctx?.blocking ?? [];
   const canStart =
     newVersion.length > 0 &&
     VERSION_RE.test(newVersion) &&
     ctx !== null &&
-    !run?.running;
+    blocking.length === 0 &&
+    !run?.running && !anotherRelease;
 
   function handleStart() {
     if (!project || !canStart || !ctx) return;
@@ -158,7 +166,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="max-h-[90dvh] overflow-auto sm:max-w-lg">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Rocket className="size-4" />
@@ -289,7 +297,7 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
                 />
                 {customVersion.trim() && !VERSION_RE.test(customVersion.trim()) && (
                   <p className="text-xs text-destructive">
-                    版本号仅允许字母数字与 - _ . +
+                    版本号应以数字开头，可包含字母或 . - +
                   </p>
                 )}
               </div>
@@ -333,23 +341,56 @@ export function ReleaseDialog({ project, open, onOpenChange }: Props) {
                       为基准（取发布分支上已提交的版本）
                     </p>
                   )}
-                  {ctx.dirty && (
-                    <p className="text-xs text-yellow-600 dark:text-yellow-400">
-                      工作区有未提交变更，发布会先被预检拦下，请先提交或暂存
+                  {blocking.length > 0 && (
+                    <div className="rounded-md bg-destructive/10 p-2 text-xs text-destructive">
+                      <p>工作区有未提交改动，请先提交或 stash 后再发布。</p>
+                      <ul className="mt-1 list-disc pl-4 font-mono">
+                        {blocking.slice(0, 8).map((file) => (
+                          <li key={file} className="break-all">
+                            {file}
+                          </li>
+                        ))}
+                      </ul>
+                      {blocking.length > 8 && (
+                        <p className="mt-1">还有 {blocking.length - 8} 个</p>
+                      )}
+                    </div>
+                  )}
+                  {ctx.ignored.length > 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      已忽略：{ctx.ignored.slice(0, 6).join("、")}
+                      {ctx.ignored.length > 6 ? ` 等 ${ctx.ignored.length} 个` : ""}
                     </p>
+                  )}
+                  {ctx.allowBuildsChanges.length > 0 && (
+                    <div className="space-y-1.5 rounded-md bg-muted p-2 text-xs text-muted-foreground">
+                      <p>{ctx.allowBuildsIgnored ? "仅 allowBuilds 变化，预检允许继续。" : "pnpm-workspace.yaml 还有其他改动。"}</p>
+                      <p>请审查并保留项目级规则，确认后可提交 pnpm-workspace.yaml。</p>
+                      <ul className="max-h-24 space-y-0.5 overflow-auto font-mono">
+                        {ctx.allowBuildsChanges.map((change) => (
+                          <li key={change.package} className="break-all">
+                            {change.package} · {change.before ?? "未设置"} → {change.after ?? "已移除"}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
                 </div>
               )
             )}
 
             <p className="text-xs text-muted-foreground">
-              将依次执行：切换到 {project?.release?.branch} 分支 → nvm use{" "}
-              {project?.release?.nodeVersion} → 升版本 → {project?.release?.script}{" "}
-              → 压缩 dist 为 zip（存放在项目 dist 目录）→ 恢复当前 node
-              版本。版本基准取发布分支上已提交的 package.json；工作区有未提交变更会直接中止。
+              使用 Node {project?.release?.nodeVersion} 构建 {project?.release?.branch} 分支，
+              将本次产物打包到 {project?.release?.outputDir || "dist"}。
             </p>
+            {anotherRelease && <p className="text-xs text-muted-foreground">另一个项目正在发布，请等待完成后重新检查。</p>}
 
             <DialogFooter>
+              {(blocking.length > 0 || ctxError) && (
+                <Button variant="outline" onClick={loadContext}>
+                  重新检查
+                </Button>
+              )}
               <Button variant="outline" onClick={() => onOpenChange(false)}>
                 取消
               </Button>

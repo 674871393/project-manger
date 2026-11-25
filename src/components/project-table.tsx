@@ -2,6 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import {
+  Activity,
   Circle,
   CircleX,
   Copy,
@@ -48,9 +49,9 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import type { Project, RunStatus } from "@/types";
-import type { ProjectRuntime } from "@/stores/runtime";
-import { useProjectsStore } from "@/stores/projects";
-import { useRuntimeStore } from "@/stores/runtime";
+import type { ProjectRuntime, StartResult } from "@/stores/runtime";
+import { isActive, useRuntimeStore } from "@/stores/runtime";
+import { describeStartResults } from "@/lib/start-results";
 
 interface Props {
   projects: Project[];
@@ -61,16 +62,25 @@ interface Props {
   onOpenLogs: (project: Project) => void;
   /** 打开发布弹窗（FR-20） */
   onRelease: (project: Project) => void;
+  onDiagnose: (project: Project) => void;
 }
 
 function StatusBadge({ runtime }: { runtime?: ProjectRuntime }) {
   const status: RunStatus = runtime?.status ?? "stopped";
 
-  if (status === "running") {
+  if (status === "ready") {
     return (
       <Badge className="gap-1.5 border-transparent bg-emerald-500/15 text-emerald-700 dark:text-emerald-400">
         <Circle className="size-2 animate-breathe fill-current motion-reduce:animate-none" />
-        运行中
+        服务已就绪
+      </Badge>
+    );
+  }
+  if (status === "running") {
+    return (
+      <Badge variant="secondary" className="gap-1.5" title="进程正在运行，尚未确认服务地址">
+        <Circle className="size-2 fill-current" />
+        进程已启动
       </Badge>
     );
   }
@@ -108,8 +118,9 @@ function StatusBadge({ runtime }: { runtime?: ProjectRuntime }) {
 }
 
 /** 项目列表（PRD FR-2）：勾选 | 名称 | 路径 | 运行地址 | 状态 | 分支 | 操作 */
-export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease }: Props) {
-  const remove = useProjectsStore((s) => s.remove);
+export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease, onDiagnose }: Props) {
+  const removeProjects = useRuntimeStore((s) => s.removeProjects);
+  const removing = useRuntimeStore((s) => s.removingProjects);
   const runtimes = useRuntimeStore((s) => s.runtimes);
   const lanIp = useRuntimeStore((s) => s.lanIp);
   const installs = useRuntimeStore((s) => s.installs);
@@ -142,54 +153,36 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
   const selectedProjects = projects.filter((p) => selected.has(p.id));
 
   async function handleBatchStart() {
-    const targets = selectedProjects.filter(
-      (p) => !["running", "starting"].includes(runtimes[p.id]?.status ?? "stopped"),
-    );
-    if (targets.length === 0) {
-      toast.info("选中的项目都已在运行");
-      return;
-    }
-    // 逐个 await，避免同时 spawn 多个 cmd 抢锁（start 内部锁是短临界区，串行即可）。
-    // 返回 false 的项目缺依赖，已转入「安装并启动」确认流程（FR-11）
-    let started = 0;
-    let diverted = 0;
-    for (const p of targets) {
-      if (await start(p)) started++;
-      else diverted++;
-    }
-    if (diverted > 0) {
-      toast.info(
-        `已启动 ${started} 个，${diverted} 个缺依赖待确认安装`,
-      );
-    } else {
-      toast.success(`已批量启动 ${started} 个项目`);
-    }
+    const results: StartResult[] = [];
+    for (const project of selectedProjects) results.push(await start(project));
+    const summary = describeStartResults(results);
+    if (results.includes("failed")) toast.warning(summary);
+    else toast.info(summary);
   }
 
   async function handleBatchStop() {
-    const targets = selectedProjects.filter(
-      (p) => (runtimes[p.id]?.status ?? "stopped") === "running",
-    );
+    const targets = selectedProjects.filter((project) => isActive(runtimes[project.id]?.status));
     if (targets.length === 0) {
       toast.info("选中的项目都未在运行");
       return;
     }
-    // 并行停止：每个项目独立进程树，互不依赖
-    await Promise.all(targets.map((p) => stop(p)));
-    toast.success(`已批量停止 ${targets.length} 个项目`);
+    const results = await Promise.all(targets.map(stop));
+    const stopped = results.filter(Boolean).length;
+    if (stopped !== results.length) toast.warning("已停止 " + stopped + " 个，失败 " + (results.length - stopped) + " 个");
+    else toast.success("已停止 " + stopped + " 个项目");
   }
 
   async function handleBatchRestart() {
-    const targets = selectedProjects.filter((p) => {
-      const st = runtimes[p.id]?.status ?? "stopped";
-      return st === "running" || st === "error";
-    });
+    const targets = selectedProjects.filter((project) => isActive(runtimes[project.id]?.status) || runtimes[project.id]?.status === "error");
     if (targets.length === 0) {
-      toast.info("选中的项目没有可重启的（未在运行且无异常）");
+      toast.info("选中的项目没有可重启的进程");
       return;
     }
-    for (const p of targets) await restart(p);
-    toast.success(`已批量重启 ${targets.length} 个项目`);
+    const results: StartResult[] = [];
+    for (const project of targets) results.push(await restart(project));
+    const summary = describeStartResults(results);
+    if (results.includes("failed")) toast.warning(summary);
+    else toast.info(summary);
   }
 
   async function handleBatchVscode() {
@@ -251,34 +244,19 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
     );
   }
 
-  async function handleBatchDelete() {
-    const running = selectedProjects.filter(
-      (p) => (runtimes[p.id]?.status ?? "stopped") === "running",
-    );
+  async function handleDelete(targets: Project[]) {
     try {
-      // 先停止所有运行中的
-      await Promise.all(running.map((p) => stop(p)));
-      await Promise.all(selectedProjects.map((p) => remove(p.id)));
-      setSelected(new Set());
-      toast.success(`已移除 ${selectedProjects.length} 个项目（磁盘文件不受影响）`);
-    } catch (e) {
-      toast.error(`批量删除失败: ${e}`);
-    }
-  }
-
-  async function handleDelete(project: Project, running: boolean) {
-    try {
-      if (running) await stop(project);
-      await remove(project.id);
-      // 同步清理勾选状态，避免工具栏残留已删项目的计数
-      setSelected((prev) => {
-        const next = new Set(prev);
-        next.delete(project.id);
-        return next;
-      });
-      toast.success(`已移除「${project.name}」（磁盘文件不受影响）`);
-    } catch (e) {
-      toast.error(`删除失败: ${e}`);
+      const { removed, failed } = await removeProjects(targets);
+      const removedIds = new Set(removed.map(({ id }) => id));
+      setSelected((previous) => new Set([...previous].filter((id) => !removedIds.has(id))));
+      if (removed.length > 0) toast.success("已移除 " + removed.length + " 个项目");
+      if (failed.length > 0) {
+        toast.warning("保留了 " + failed.map(({ name }) => "「" + name + "」").join("、"), {
+          description: "项目正在发布或进程停止失败，请处理后重试。",
+        });
+      }
+    } catch (error) {
+      toast.error("保存项目列表失败: " + error);
     }
   }
 
@@ -357,13 +335,13 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                   <AlertDialogDescription>
                     仅从列表移除记录，不删除磁盘上的项目文件。
                     {selectedProjects.some(
-                      (p) => (runtimes[p.id]?.status ?? "stopped") === "running",
+                      (p) => isActive(runtimes[p.id]?.status) || installs[p.id]?.status === "running",
                     ) && " 部分项目正在运行，将先停止其进程。"}
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
                   <AlertDialogCancel>取消</AlertDialogCancel>
-                  <AlertDialogAction onClick={handleBatchDelete}>
+                  <AlertDialogAction onClick={() => handleDelete(selectedProjects)}>
                     移除
                   </AlertDialogAction>
                 </AlertDialogFooter>
@@ -396,11 +374,12 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
               const branch = branches[project.id];
               const runtime = runtimes[project.id];
               const status: RunStatus = runtime?.status ?? "stopped";
-              const canStart = status === "stopped" || status === "error";
-              // 展示用局域网地址（手机同 WiFi 可访问）；点击打开仍走 localhost 最稳
-              const displayUrl = lanIp && runtime?.url
-                ? runtime.url.replace(/\/\/(localhost|127\.0\.0\.1)/, `//${lanIp}`)
-                : runtime?.url;
+              const active = isActive(status);
+              const deleting = removing.has(project.id);
+              const localUrl = status === "ready" ? runtime?.url : undefined;
+              const displayUrl = lanIp && runtime?.lanReachable && localUrl
+                ? localUrl.replace(/\/\/(localhost|127\.0\.0\.1|\[::1\])/, "//" + lanIp)
+                : localUrl;
 
               return (
                 <TableRow key={project.id}>
@@ -426,6 +405,14 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                     )}
                     <div className="relative flex items-center gap-2 font-medium">
                       <span className="cursor-default">{project.name}</span>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button variant="ghost" size="icon-sm" onClick={() => onDiagnose(project)} aria-label={`体检 ${project.name}`}>
+                            <Activity className="size-3.5" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>项目体检</TooltipContent>
+                      </Tooltip>
                     </div>
                   </TableCell>
 
@@ -451,12 +438,12 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                   </TableCell>
 
                   <TableCell className="text-center">
-                    {runtime?.url && status === "running" ? (
+                    {localUrl ? (
                       <div className="inline-flex items-center gap-1">
                         <button
                           type="button"
                           className="cursor-pointer text-sm text-primary underline-offset-4 hover:underline"
-                          onClick={() => openUrl(runtime.url!)}
+                          onClick={() => { void openUrl(localUrl).catch((error) => toast.error("打开地址失败: " + error)); }}
                           title="用默认浏览器打开"
                         >
                           {displayUrl}
@@ -468,7 +455,7 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                               size="icon-sm"
                               aria-label={`复制 ${project.name} 运行地址`}
                               onClick={async () => {
-                                await navigator.clipboard.writeText(displayUrl ?? runtime.url!);
+                                await navigator.clipboard.writeText(displayUrl ?? localUrl);
                                 toast.success("地址已复制");
                               }}
                             >
@@ -479,8 +466,8 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                         </Tooltip>
                       </div>
                     ) : project.manualPort ? (
-                      <span className="text-sm text-muted-foreground">
-                        http://localhost:{project.manualPort}
+                      <span className="text-xs text-muted-foreground" title="配置端口尚未通过本次运行验证">
+                        端口 {project.manualPort} · 未就绪
                       </span>
                     ) : (
                       <span className="text-muted-foreground">—</span>
@@ -541,7 +528,7 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                           <Button
                             variant="ghost"
                             size="icon"
-                            disabled={installs[project.id]?.status === "running"}
+                            disabled={deleting || installs[project.id]?.status === "running"}
                             onClick={() => handleInstall(project)}
                             aria-label={`安装 ${project.name} 依赖`}
                           >
@@ -585,12 +572,13 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                         </Tooltip>
                       )}
 
-                      {status === "running" ? (
+                      {active ? (
                         <Tooltip>
                           <TooltipTrigger asChild>
                             <Button
                               variant="ghost"
                               size="icon"
+                              disabled={deleting}
                               onClick={() => stop(project)}
                               aria-label={`停止 ${project.name}`}
                             >
@@ -605,7 +593,7 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                             <Button
                               variant="ghost"
                               size="icon"
-                              disabled={!canStart}
+                              disabled={deleting}
                               onClick={() => start(project)}
                               aria-label={`启动 ${project.name}`}
                             >
@@ -621,7 +609,7 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                           <Button
                             variant="ghost"
                             size="icon"
-                            disabled={status !== "running"}
+                            disabled={!active || deleting}
                             onClick={() => restart(project)}
                             aria-label={`重启 ${project.name}`}
                           >
@@ -667,13 +655,13 @@ export function ProjectTable({ projects, branches, onEdit, onOpenLogs, onRelease
                             </AlertDialogTitle>
                             <AlertDialogDescription>
                               仅从列表移除记录，不删除磁盘上的项目文件。
-                              {status === "running" && " 项目正在运行，将先停止其进程。"}
+                              {(active || installs[project.id]?.status === "running") && " 将先停止关联进程。"}
                             </AlertDialogDescription>
                           </AlertDialogHeader>
                           <AlertDialogFooter>
                             <AlertDialogCancel>取消</AlertDialogCancel>
                             <AlertDialogAction
-                              onClick={() => handleDelete(project, status === "running")}
+                              onClick={() => handleDelete([project])}
                             >
                               移除
                             </AlertDialogAction>

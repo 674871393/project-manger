@@ -2,8 +2,8 @@
 //
 // 存 appDataDir/settings.json，两项：
 // - minimize_on_close：点窗口 X 是退出（默认）还是最小化到托盘
-// - autostart 由 tauri-plugin-autostart 管理（写注册表/启动项），
-//   前端开关时直接调插件的 enable/disable，这里不重复存
+// - 正式构建通过 tauri-plugin-autostart 管理系统启动项。
+// - 开发版依赖本地开发服务器，只保存窗口行为设置。
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -27,6 +27,14 @@ impl Default for AppSettings {
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsView {
+    #[serde(flatten)]
+    settings: AppSettings,
+    autostart_available: bool,
+}
+
 fn settings_path(app: &AppHandle) -> Option<std::path::PathBuf> {
     app.path()
         .app_data_dir()
@@ -46,35 +54,35 @@ pub fn load_settings_inner(app: &AppHandle) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
+pub fn load_settings(app: AppHandle) -> Result<SettingsView, String> {
     let mut settings = load_settings_inner(&app)?;
-    // autostart 以插件实际状态为准（用户可能在外部改过启动项）
-    settings.autostart = app.autolaunch().is_enabled().unwrap_or(false);
-    Ok(settings)
+    let autostart_available = !tauri::is_dev();
+    settings.autostart = if autostart_available {
+        app.autolaunch().is_enabled().map_err(|e| e.to_string())?
+    } else {
+        false
+    };
+    Ok(SettingsView {
+        settings,
+        autostart_available,
+    })
 }
 
 #[tauri::command]
-pub fn save_settings(
-    app: AppHandle,
-    settings: AppSettings,
-) -> Result<(), String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("settings.json"), json).map_err(|e| e.to_string())?;
-
-    // 开机自启联动插件（写注册表启动项）。
-    // 只在状态确实需要变化时才写：disable 一个从未 enable 过的条目
-    // 会因注册表值不存在报 os error 2，enable 已启用的也是无谓重复。
-    let autolaunch = app.autolaunch();
-    let enabled = autolaunch.is_enabled().unwrap_or(false);
-    if settings.autostart && !enabled {
-        autolaunch.enable().map_err(|e| e.to_string())?;
-    } else if !settings.autostart && enabled {
-        autolaunch.disable().map_err(|e| e.to_string())?;
+pub fn save_settings(app: AppHandle, mut settings: AppSettings) -> Result<(), String> {
+    let path = settings_path(&app).ok_or("无法定位设置文件")?;
+    if tauri::is_dev() {
+        settings.autostart = load_settings_inner(&app)?.autostart;
+    } else {
+        let autolaunch = app.autolaunch();
+        if settings.autostart {
+            // 重新登记当前正式版路径，修复移动旧版后留下的启动项。
+            autolaunch.enable().map_err(|e| e.to_string())?;
+        } else if autolaunch.is_enabled().map_err(|e| e.to_string())? {
+            autolaunch.disable().map_err(|e| e.to_string())?;
+        }
     }
-    Ok(())
+
+    let json = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+    crate::commands::save_local_file(&path, &json).map_err(|e| format!("保存设置失败: {e}"))
 }

@@ -31,6 +31,9 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # 仅用 Local 取本地日期（zip 文件名）；本就是依赖树里的传递依赖，不增加体积
 chrono = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_Diagnostics_ToolHelp"] }
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

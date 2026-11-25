@@ -11,6 +11,13 @@ export interface ReleaseConfig {
   nodeVersion: string;
   /** 构建脚本名，如 "build:prod" */
   script: string;
+  /** 相对项目目录，旧配置默认 dist */
+  outputDir?: string;
+  /**
+   * 预检额外忽略的路径（文件名、相对路径或简单 glob）。
+   * `.env.development` 始终忽略，不必写在这里。
+   */
+  ignorePaths?: string[];
 }
 
 /** read_release_context 的返回（FR-20 发布弹窗：版本基准 + 工作区状态） */
@@ -23,8 +30,63 @@ export interface ReleaseContext {
   currentBranch: string | null;
   /** 当前工作区 package.json 的版本（可能与发布基准不同） */
   workingVersion: string | null;
-  /** 工作区是否有未提交变更（有则发布会先被预检拦下） */
+  /** 是否还有会拦住发布的未提交变更（已忽略的文件不算） */
   dirty: boolean;
+  /** 会拦住发布的路径 */
+  blocking: string[];
+  /** 预检已忽略的路径（.env.development、配置项、仅 allowBuilds 变化的 pnpm-workspace.yaml） */
+  ignored: string[];
+  /** pnpm-workspace.yaml 的差异只有 allowBuilds 块 */
+  allowBuildsIgnored: boolean;
+  allowBuildsChanges: { package: string; before: string | null; after: string | null }[];
+}
+
+export interface ReleaseRecord {
+  id: string;
+  projectId: string;
+  projectName: string;
+  version: string;
+  branch: string;
+  commit: string | null;
+  nodeVersion: string;
+  startedAt: number;
+  durationMs: number;
+  success: boolean;
+  zipPath: string | null;
+  error: string | null;
+}
+
+export interface LaunchPlan {
+  id: string;
+  name: string;
+  projectIds: string[];
+}
+
+export interface LaunchPlanConfig {
+  plans: LaunchPlan[];
+  lastUsedId: string | null;
+}
+
+type VersionCheck = { Ok: string } | { Err: string };
+
+export interface ProjectDiagnostics {
+  directoryExists: boolean;
+  packageExists: boolean;
+  workspaceRoot: string | null;
+  detectedPackageManager: string | null;
+  node: VersionCheck;
+  packageManager: VersionCheck;
+  dependenciesAvailable: boolean;
+  scriptExists: boolean;
+  gitBranch: string | null;
+}
+
+export interface PortOwner {
+  port: number;
+  pid: number;
+  address: string;
+  process: string | null;
+  projectId: string | null;
 }
 
 /** 持久化到 appDataDir/projects.json */
@@ -50,7 +112,7 @@ export interface ProjectInspection {
 }
 
 /** 运行时状态（内存，不持久化；M2 进程核心时使用） */
-export type RunStatus = "stopped" | "starting" | "running" | "error";
+export type RunStatus = "stopped" | "starting" | "running" | "ready" | "error";
 
 export interface RuntimeState {
   projectId: string;

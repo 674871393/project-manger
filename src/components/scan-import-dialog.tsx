@@ -36,7 +36,7 @@ interface ScannedProject {
 
 /** 目录扫描批量导入（PRD 开放问题 1）：选目录 → 扫一层子文件夹 → 勾选导入 */
 export function ScanImportDialog({ open, onOpenChange }: Props) {
-  const { projects, add } = useProjectsStore();
+  const { projects, addMany } = useProjectsStore();
 
   const [root, setRoot] = useState("");
   const [scanning, setScanning] = useState(false);
@@ -86,8 +86,7 @@ export function ScanImportDialog({ open, onOpenChange }: Props) {
     if (targets.length === 0) return;
     setImporting(true);
     try {
-      for (const t of targets) {
-        const project: Project = {
+      await addMany(targets.map((t): Project => ({
           id: crypto.randomUUID(),
           name: t.inspection.name,
           path: t.path,
@@ -95,9 +94,7 @@ export function ScanImportDialog({ open, onOpenChange }: Props) {
           script: t.inspection.script,
           framework: t.inspection.framework as Project["framework"],
           createdAt: Date.now(),
-        };
-        await add(project);
-      }
+      })));
       toast.success(`已导入 ${targets.length} 个项目`);
       onOpenChange(false);
     } catch (e) {

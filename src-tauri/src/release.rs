@@ -1,33 +1,26 @@
-// 一键发布流水线（PRD FR-20）
-//
-// 把日常发版的手工五步串成一条流水线，Rust 侧单线程串行执行：
-//   预检（git 工作区必须干净）
-//   → checkout <发布分支>
-//   → nvm use <配置版本>（记录原版本，结束后切回）
-//   → bump package.json 的 version（文本替换保持原文件格式）
-//   → <pm> run <构建脚本>（输出流式进日志抽屉）
-//   → zip dist/ → dist/<项目名>_v<版本>_<日期>.zip（同日同版本重发追加 _1/_2，不覆盖）
-//   → nvm use <原版本>（best effort）
-//
-// 版本基准是「发布分支上已提交的 package.json」，不是工作区当前检出/改了一半的那份：
-// 弹窗用 read_release_context 读基准，checkout 之后 bump 前再校验一次实际版本与
-// 弹窗确认的一致（expected_version），预览过期就中止而不是默默发布错误版本。
-//
-// 任一步失败即中止（已执行的步骤不回滚，弹窗会标注失败位置）；
-// 每步开始/结束发 `release-step` 事件，结束后发 `release-finished`；
-// 命令输出走 `log-line`（kind = "release"），与 dev 日志共用抽屉和落盘通道。
+// 本地发布：校验 Git 工作区，在构建子进程中选定 Node，打包本轮产物并记录结果。
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
+use std::time::Instant;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::commands::Project;
-use crate::process_manager::{compact_log_file, emit_tool_log, spawn_pipe_readers};
+use crate::commands::{Project, ReleaseConfig};
+use crate::diagnostics::{git_head, hide_console};
 #[cfg(windows)]
 use crate::process_manager::CREATE_NO_WINDOW;
+use crate::process_manager::{
+    compact_log_file, emit_tool_log, spawn_pipe_readers, validate_package_manager,
+};
+use crate::release_artifacts::{select_artifacts, snapshot, validate_output_dir, write_archive};
+use crate::release_history::{create_history_log, save_record, ReleaseRecord};
+use crate::release_node::{build_command, resolve_node, validate_node_version};
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -81,17 +74,6 @@ fn ratio(raw_bytes: u64, packed: u64) -> String {
     format!("{:.0}%", packed as f64 / raw_bytes as f64 * 100.0)
 }
 
-/// dist 顶层是否还有子目录（有则多半是历史构建产物）
-fn dist_has_subdir(dist: &Path) -> bool {
-    std::fs::read_dir(dist)
-        .map(|entries| {
-            entries
-                .flatten()
-                .any(|e| e.path().is_dir())
-        })
-        .unwrap_or(false)
-}
-
 /// 发布弹窗的上下文：一次 invoke 取回，避免多次调用之间状态漂移
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -104,15 +86,26 @@ pub struct ReleaseContext {
     pub current_branch: Option<String>,
     /// 当前工作区 package.json 的版本（可能与发布基准不同）
     pub working_version: Option<String>,
-    /// 工作区是否有未提交变更（有则发布会先被预检拦下）
+    /// 是否还有会拦住发布的未提交变更（已忽略的文件不算）
     pub dirty: bool,
+    /// 会拦住发布的路径
+    pub blocking: Vec<String>,
+    /// 预检已忽略的路径
+    pub ignored: Vec<String>,
+    /// pnpm-workspace.yaml 的差异只有 allowBuilds 块
+    pub allow_builds_ignored: bool,
+    pub allow_builds_changes: Vec<AllowBuildsChange>,
 }
 
 /// 读发布弹窗需要的上下文（FR-20）：发布分支的版本基准 + 当前工作区状态。
 /// 基准走 `git show <分支>:package.json`——工作区可能检出了别的分支、
 /// 或上次发布后版本号还没提交，读工作区文件会拿到错误的基准。
 #[tauri::command]
-pub fn read_release_context(path: String, branch: String) -> Result<ReleaseContext, String> {
+pub fn read_release_context(
+    path: String,
+    branch: String,
+    ignore_paths: Option<Vec<String>>,
+) -> Result<ReleaseContext, String> {
     let dir = Path::new(&path);
     if !is_safe_token(&branch, true) {
         return Err(format!(
@@ -125,7 +118,7 @@ pub fn read_release_context(path: String, branch: String) -> Result<ReleaseConte
     let mut found: Option<(String, String)> = None;
     let mut last_err = String::new();
     for reference in [branch.clone(), format!("origin/{branch}")] {
-        let (ok, out, err) = run_capture(dir, &format!("git show {reference}:package.json"))
+        let (ok, out, err) = run_capture(dir, &format!("git show {reference}:./package.json"))
             .map_err(|e| format!("执行 git show 失败: {e}"))?;
         if ok {
             found = Some((reference, parse_version(&out)?));
@@ -140,366 +133,371 @@ pub fn read_release_context(path: String, branch: String) -> Result<ReleaseConte
         )
     })?;
 
+    let ws = workspace_status(dir, ignore_paths.as_deref().unwrap_or(&[]))?;
+
     Ok(ReleaseContext {
         release_version,
         release_ref,
-        current_branch: current_git_branch(dir),
+        current_branch: git_head(dir).ok().flatten(),
         working_version: read_package_version_at(&dir.join("package.json")).ok(),
-        dirty: matches!(
-            run_capture(dir, "git status --porcelain"),
-            Ok((true, ref out, _)) if !out.trim().is_empty()
-        ),
+        dirty: !ws.blocking.is_empty(),
+        blocking: ws.blocking,
+        ignored: ws.ignored,
+        allow_builds_ignored: ws.allow_builds_ignored,
+        allow_builds_changes: ws.allow_builds_changes,
     })
 }
 
-/// 启动发布（立即返回，流水线在后台线程跑，进度走事件）。
-/// expected_version 是弹窗里确认过的版本基准，checkout 后据此校验。
+#[derive(Default)]
+pub(crate) struct ReleaseManager(Mutex<Option<String>>);
+
+impl ReleaseManager {
+    pub(crate) fn active_project(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn reserve(&self, project_id: &str) -> Result<(), String> {
+        let mut active = self.0.lock().unwrap();
+        if active.is_some() {
+            return Err("已有发布任务正在运行，请等它结束后再开始".into());
+        }
+        *active = Some(project_id.into());
+        Ok(())
+    }
+
+    fn finish(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 #[tauri::command]
-pub fn start_release(
+pub(crate) fn get_active_release(state: State<ReleaseManager>) -> Option<String> {
+    state.active_project()
+}
+
+#[tauri::command]
+pub(crate) fn start_release(
     app: AppHandle,
     project: Project,
     new_version: String,
     expected_version: String,
 ) -> Result<(), String> {
-    let config = project
-        .release
-        .clone()
-        .ok_or_else(|| "该项目未配置发布参数，请先在编辑里填写".to_string())?;
-    let new_version = new_version.trim().to_string();
-    if new_version.is_empty() {
-        return Err("新版本号不能为空".into());
-    }
-    let expected_version = expected_version.trim().to_string();
-    if expected_version.is_empty() {
-        return Err("缺少发布基准版本，请重新打开发布弹窗".into());
-    }
-    // 命令是 `cmd /C` 拼接执行的：分支/脚本/版本含空格或 & | 等元字符会被 cmd
-    // 拆成别的命令，先做字符白名单校验（表单侧也校验，这里兜底）
-    if !is_safe_token(&config.branch, true) {
-        return Err(format!(
-            "发布分支「{}」含非法字符（仅允许字母数字与 - _ . /）",
-            config.branch
-        ));
-    }
-    if !is_safe_token(&config.node_version, false) {
-        return Err(format!(
-            "node 版本「{}」含非法字符（应为形如 16.20.0 的完整版本号）",
-            config.node_version
-        ));
-    }
-    if !is_safe_token(&config.script, false) {
-        return Err(format!(
-            "构建脚本「{}」含非法字符（仅允许字母数字与 - _ . : @ +）",
-            config.script
-        ));
-    }
-    if !is_safe_token(&new_version, false) {
-        return Err(format!(
-            "新版本号「{new_version}」含非法字符（仅允许字母数字与 - _ . +）"
-        ));
-    }
+    let config = project.release.clone().ok_or("该项目未配置发布参数")?;
+    let new_version = new_version.trim().to_owned();
+    let expected_version = expected_version.trim().to_owned();
+    validate_release(&project, &config, &new_version, &expected_version)?;
+    app.state::<ReleaseManager>().reserve(&project.id)?;
 
-    thread::spawn(move || {
-        // 先截断落盘日志，保证文件有界（与 start 的策略一致）
-        compact_log_file(&app, &project.id);
-
-        let result = run_pipeline(&app, &project, &config, &new_version, &expected_version);
-        let (success, zip_path, error) = match result {
-            Ok(zip) => {
-                // 成功后版本号留在工作区且未提交（PRD：不自动 commit）——
-                // 不提醒的话，下次发布会被预检拦下，用户会莫名其妙
-                emit_tool_log(
-                    &app,
-                    &project.id,
-                    "release",
-                    &format!(
-                        "发布完成；package.json 已升为 {new_version}（未提交），\
-                         请记得 commit，否则下次发布预检会中止"
-                    ),
-                );
-                (true, Some(zip), None)
-            }
-            Err((step, msg)) => (false, None, Some(format!("{step}: {msg}"))),
-        };
-        let _ = app.emit(
-            "release-finished",
-            ReleaseFinishedEvent {
-                project_id: project.id.clone(),
-                success,
-                zip_path,
-                error,
-            },
-        );
-    });
+    let worker_app = app.clone();
+    let spawned = thread::Builder::new()
+        .name("local-release".into())
+        .spawn(move || {
+            execute_release(worker_app, project, config, new_version, expected_version);
+        });
+    if let Err(error) = spawned {
+        app.state::<ReleaseManager>().finish();
+        return Err(format!("启动发布线程失败: {error}"));
+    }
     Ok(())
 }
 
-fn run_pipeline(
-    app: &AppHandle,
+fn validate_release(
     project: &Project,
-    config: &crate::commands::ReleaseConfig,
-    new_version: &str,
-    expected_version: &str,
-) -> Result<String, PipelineError> {
-    let dir = Path::new(&project.path);
-
-    // 0. 预检：工作区必须干净。不自动 stash——动用户的暂存区风险太大
-    step(app, project, "precheck", "running", None);
-    let (git_ok, status_out, git_err) = run_capture(dir, "git status --porcelain")
-        .map_err(|e| ("precheck", format!("无法读取 git 状态: {e}")))?;
-    if !git_ok {
-        // 非 0 退出码说明 git 本身报错（不是 git 仓库 / .git 损坏），诊断在 stderr
-        return Err(("precheck", format!("无法读取 git 状态: {}", git_err.trim())));
+    config: &ReleaseConfig,
+    version: &str,
+    expected: &str,
+) -> Result<(), String> {
+    validate_package_manager(&project.package_manager)?;
+    if !is_safe_token(&config.branch, true) {
+        return Err("发布分支格式无效".into());
     }
-    if !status_out.trim().is_empty() {
-        return Err((
-            "precheck",
-            "工作区有未提交变更，请先提交或暂存（工具不会自动 stash）".into(),
-        ));
+    if !validate_node_version(&config.node_version) {
+        return Err("请填写完整 Node 版本号，例如 20.18.0".into());
     }
-    step(app, project, "precheck", "success", None);
-
-    // 1. 切换发布分支
-    step(app, project, "checkout", "running", None);
-    run_step(app, project, dir, &format!("git checkout {}", config.branch))
-        .map_err(|e| ("checkout", e))?;
-    step(app, project, "checkout", "success", None);
-
-    // 2. 切 node 版本（记录原版本用于恢复）
-    step(app, project, "node", "running", None);
-    let (node_ok, node_out, node_err) = run_capture(dir, "node -v")
-        .map_err(|e| ("node", format!("无法获取当前 node 版本: {e}")))?;
-    if !node_ok {
-        return Err((
-            "node",
-            format!("无法获取当前 node 版本: {}", node_err.trim()),
-        ));
+    if !is_safe_token(&config.script, false) {
+        return Err("构建脚本名格式无效".into());
     }
-    let current_node = node_out.trim().trim_start_matches('v').to_string();
-    let need_switch = current_node != config.node_version;
-    if need_switch {
-        run_step(app, project, dir, &format!("nvm use {}", config.node_version)).map_err(|e| {
-            (
-                "node",
-                format!(
-                    "{e}；请用 `nvm ls` 确认 {} 已安装。nvm-windows 切换要改 node 安装\
-                     目录的符号链接，通常需要管理员权限——可以管理员身份重开本工具再试",
-                    config.node_version
-                ),
-            )
-        })?;
+    if !valid_release_version(version) {
+        return Err("新版本号格式无效".into());
     }
-    step(
-        app,
-        project,
-        "node",
-        "success",
-        Some(if need_switch {
-            format!("{current_node} → {}", config.node_version)
-        } else {
-            format!("已是 {}", config.node_version)
-        }),
-    );
-
-    // 3. 升版本（先改再 build，构建产物里能带上新版本号）
-    step(app, project, "bump", "running", None);
-    let pkg_path = dir.join("package.json");
-    // 防呆：checkout 后这份 package.json 才是发布分支的。与弹窗确认过的基准不符
-    // 说明预览已过期（弹窗打开后分支被更新过）——中止，别默默发布错误版本号
-    let actual = read_package_version_at(&pkg_path).map_err(|e| ("bump", e))?;
-    if actual != expected_version {
-        return Err((
-            "bump",
-            format!(
-                "发布分支版本已变化：弹窗确认时是 {expected_version}，现在是 {actual}。\
-                 请关闭弹窗重新打开、确认新版本号后再发布"
-            ),
-        ));
+    if expected.is_empty() {
+        return Err("缺少发布基准版本，请重新检查".into());
     }
-    let old_version = write_package_version(&pkg_path, new_version).map_err(|e| ("bump", e))?;
-    step(
-        app,
-        project,
-        "bump",
-        "success",
-        Some(format!("{old_version} → {new_version}")),
-    );
-
-    // 4. 构建 + 5. 压缩：任一步失败 → 还原版本号再返回错误
-    //（package.json 回到发布前的状态，工作区干净，用户可直接重试）
-    let outcome = (|| -> Result<String, PipelineError> {
-        step(app, project, "build", "running", None);
-        run_step(
-            app,
-            project,
-            dir,
-            &format!("{} run {}", project.package_manager, config.script),
-        )
-        .map_err(|e| ("build", e))?;
-        step(app, project, "build", "success", None);
-
-        step(app, project, "zip", "running", None);
-        let dist = dir.join("dist");
-        if !dist.is_dir() {
-            return Err(("zip", "dist 目录不存在（构建脚本产物路径不是 dist？）".into()));
-        }
-        if is_dir_empty(&dist) {
-            return Err(("zip", "dist 目录为空，未生成产物".into()));
-        }
-        // 同日同版本重发时追加 _1/_2…，不静默覆盖历史产物
-        let zip_path = unique_zip_path(
-            &dist,
-            format!(
-                "{}_v{}_{}",
-                sanitize_filename(&project.name),
-                new_version,
-                today_compact(),
-            ),
-        );
-        let stats = zip_dist(&dist, &zip_path, ZIP_LEVEL).map_err(|e| ("zip", e))?;
-        let packed = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
-        // 把「打进去多少东西」写进日志：产物比手压的大时，先看这行是内容多了
-        // 还是压缩器弱了（跟 NanaZip 的 Original / Packed / Ratio 三列对得上）
-        emit_tool_log(
-            app,
-            &project.id,
-            "release",
-            &format!(
-                "压缩完成：{} 个文件，原始 {} → 压缩后 {}（{}）｜deflate 级别 {ZIP_LEVEL}｜根目录 {}",
-                stats.files,
-                human_size(stats.raw_bytes),
-                human_size(packed),
-                ratio(stats.raw_bytes, packed),
-                stats.root.display(),
-            ),
-        );
-        // 以 dist 为根且顶层还有子目录 → 历史构建产物被一并打进去了，提醒一句
-        if stats.root == dist && dist_has_subdir(&dist) {
-            emit_tool_log(
-                app,
-                &project.id,
-                "release",
-                "提示：dist 顶层有散文件，已按整个 dist 打包；\
-                 若里面混着历史构建产物（旧版本子目录 / source map），包会明显偏大",
-            );
-        }
-        step(
-            app,
-            project,
-            "zip",
-            "success",
-            Some(format!(
-                "{}（{}）",
-                zip_path.to_string_lossy(),
-                human_size(packed)
-            )),
-        );
-        Ok(zip_path.to_string_lossy().to_string())
-    })();
-
-    let outcome = match outcome {
-        Ok(zip) => Ok(zip),
-        Err((step_name, mut msg)) => {
-            // 还原版本号（best effort：还原失败也不掩盖原始错误）
-            match write_package_version(&dir.join("package.json"), &old_version) {
-                Ok(restored) => {
-                    emit_tool_log(
-                        app,
-                        &project.id,
-                        "release",
-                        &format!("发布失败，已还原版本号为 {restored}"),
-                    );
-                    msg.push_str("；版本号已还原");
-                }
-                Err(e) => {
-                    emit_tool_log(
-                        app,
-                        &project.id,
-                        "release",
-                        &format!("还原版本号失败: {e}（当前 version 仍为 {new_version}）"),
-                    );
-                    msg.push_str(&format!("；版本号还原失败: {e}"));
-                }
-            }
-            Err((step_name, msg))
-        }
-    };
-
-    // 6. 恢复 node 版本（best effort：失败只提示，不影响发布结果）
-    if need_switch {
-        step(app, project, "restore", "running", None);
-        match run_step(app, project, dir, &format!("nvm use {current_node}")) {
-            Ok(()) => step(
-                app,
-                project,
-                "restore",
-                "success",
-                Some(format!("已切回 {current_node}")),
-            ),
-            Err(e) => step(app, project, "restore", "error", Some(e)),
-        }
-    }
-
-    outcome
+    validate_output_dir(&config.output_dir)?;
+    Ok(())
 }
 
-fn step(
-    app: &AppHandle,
-    project: &Project,
-    step: &'static str,
-    status: &'static str,
-    message: Option<String>,
+fn valid_release_version(version: &str) -> bool {
+    version
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".+-".contains(&byte))
+        && !version.ends_with(['.', '+', '-'])
+}
+
+fn execute_release(
+    app: AppHandle,
+    project: Project,
+    config: ReleaseConfig,
+    version: String,
+    expected: String,
 ) {
+    compact_log_file(&app, &project.id);
+    let started = Instant::now();
+    let mut record = ReleaseRecord::new(&project, &config, &version);
+    let history_log = create_history_log(&app, &record.id);
+    let mut task = ReleaseTask {
+        app: &app,
+        project: &project,
+        history_log: history_log.as_deref().ok(),
+        commit: None,
+    };
+    let result = match history_log.as_ref() {
+        Ok(_) => run_pipeline(&mut task, &config, &version, &expected),
+        Err(error) => Err(("precheck", error.clone())),
+    };
+    match result {
+        Ok(zip) => {
+            task.log(&format!(
+                "发布完成，package.json 版本已更新为 {version}，请按需提交"
+            ));
+            record.success = true;
+            record.zip_path = Some(zip);
+        }
+        Err((step, error)) => {
+            task.step(step, "error", Some(error.clone()));
+            task.log(&error);
+            record.error = Some(format!("{step}: {error}"));
+        }
+    }
+    record.commit = task.commit.take();
+    record.duration_ms = started.elapsed().as_millis() as u64;
+    if let Err(error) = save_record(&app, &record) {
+        task.log(&error);
+    }
+    app.state::<ReleaseManager>().finish();
     let _ = app.emit(
-        "release-step",
-        ReleaseStepEvent {
-            project_id: project.id.clone(),
-            step,
-            status,
-            message,
+        "release-finished",
+        ReleaseFinishedEvent {
+            project_id: record.project_id,
+            success: record.success,
+            zip_path: record.zip_path,
+            error: record.error,
         },
     );
 }
 
-/// 同步执行一步命令：stdout/stderr 转发 `log-line`（kind = "release"），
-/// 等待退出，非 0 退出码返回 Err。
-fn run_step(
-    app: &AppHandle,
-    project: &Project,
-    cwd: &Path,
-    command: &str,
-) -> Result<(), String> {
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", command])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+struct ReleaseTask<'a> {
+    app: &'a AppHandle,
+    project: &'a Project,
+    history_log: Option<&'a Path>,
+    commit: Option<String>,
+}
+
+impl ReleaseTask<'_> {
+    fn log(&self, line: &str) {
+        emit_tool_log(self.app, &self.project.id, "release", line);
+        if let Some(path) = self.history_log {
+            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                let _ = writeln!(file, "[release] {line}");
+            }
+        }
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("执行 `{command}` 失败: {e}"))?;
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    // 擦成 Box<dyn Read> 才能放进同一个数组——两个管道类型不同
-    let pipes: [(&str, Option<Box<dyn std::io::Read + Send>>); 2] =
-        [("stdout", stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>)),
-         ("stderr", stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>))];
-    spawn_pipe_readers(app, &project.id, "release", pipes);
+    fn step(&self, step: &'static str, status: &'static str, message: Option<String>) {
+        let _ = self.app.emit(
+            "release-step",
+            ReleaseStepEvent {
+                project_id: self.project.id.clone(),
+                step,
+                status,
+                message,
+            },
+        );
+    }
 
-    match child.wait() {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(format!(
-            "`{command}` 退出码 {}（详见日志）",
-            status.code().unwrap_or(-1)
+    fn run(&self, command: &mut Command, label: &str) -> Result<(), String> {
+        self.log(&format!("执行 {label}"));
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_console(command);
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("执行 {label} 失败: {e}"))?;
+        let pipes: [(&str, Option<Box<dyn std::io::Read + Send>>); 2] = [
+            (
+                "stdout",
+                child.stdout.take().map(|pipe| Box::new(pipe) as _),
+            ),
+            (
+                "stderr",
+                child.stderr.take().map(|pipe| Box::new(pipe) as _),
+            ),
+        ];
+        let readers = spawn_pipe_readers(
+            self.app,
+            &self.project.id,
+            "release",
+            None,
+            self.history_log,
+            pipes,
+        );
+        let status = child
+            .wait()
+            .map_err(|e| format!("等待 {label} 结束失败: {e}"))?;
+        for reader in readers {
+            let _ = reader.join();
+        }
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{label} 退出码 {}（详见日志）",
+                status.code().unwrap_or(-1)
+            ))
+        }
+    }
+}
+
+fn run_pipeline(
+    task: &mut ReleaseTask<'_>,
+    config: &ReleaseConfig,
+    version: &str,
+    expected: &str,
+) -> Result<String, PipelineError> {
+    let dir = Path::new(&task.project.path);
+    task.step("precheck", "running", None);
+    let workspace = workspace_status(dir, &config.ignore_paths).map_err(|e| ("precheck", e))?;
+    if !workspace.blocking.is_empty() {
+        return Err((
+            "precheck",
+            format!(
+                "工作区有未提交变更（{}），请先提交或 stash 后再发布",
+                join_paths(&workspace.blocking, 12)
+            ),
+        ));
+    }
+    task.step("precheck", "success", None);
+
+    task.step("node", "running", None);
+    let node = resolve_node(&config.node_version).map_err(|e| ("node", e))?;
+    let mut build = build_command(task.project, &node, &config.script).map_err(|e| ("node", e))?;
+    task.step(
+        "node",
+        "success",
+        Some(format!("本次构建使用 Node {}", config.node_version)),
+    );
+
+    task.step("checkout", "running", None);
+    let mut checkout = Command::new("git");
+    checkout.args(["checkout", &config.branch]).current_dir(dir);
+    task.run(&mut checkout, &format!("git checkout {}", config.branch)).map_err(|error| {
+        if workspace.allow_builds_ignored {
+            ("checkout", format!("{error}；如发布分支上该配置不同，请先审查并提交 pnpm-workspace.yaml 的改动"))
+        } else { ("checkout", error) }
+    })?;
+    task.commit = match run_capture(dir, "git rev-parse HEAD") {
+        Ok((true, out, _)) => Some(out.trim().into()),
+        _ => None,
+    };
+    task.step(
+        "checkout",
+        "success",
+        task.commit
+            .as_ref()
+            .map(|commit| commit.chars().take(8).collect()),
+    );
+
+    task.step("bump", "running", None);
+    let package = dir.join("package.json");
+    let actual = read_package_version_at(&package).map_err(|e| ("bump", e))?;
+    if actual != expected {
+        return Err((
+            "bump",
+            format!("发布版本基准已变化：确认时为 {expected}，当前为 {actual}。请重新检查"),
+        ));
+    }
+    let old_version = write_package_version(&package, version).map_err(|e| ("bump", e))?;
+    task.step(
+        "bump",
+        "success",
+        Some(format!("{old_version} → {version}")),
+    );
+
+    let outcome = build_and_package(task, config, version, &mut build, dir);
+    if let Err((step, mut error)) = outcome {
+        match restore_package_version(&package, version, &old_version) {
+            Ok(()) => error.push_str("；package.json 版本已恢复"),
+            Err(restore) => error.push_str(&format!("；恢复版本失败: {restore}")),
+        }
+        return Err((step, error));
+    }
+    outcome
+}
+
+fn restore_package_version(path: &Path, written: &str, original: &str) -> Result<(), String> {
+    let current = read_package_version_at(path)?;
+    if current == original {
+        return Ok(());
+    }
+    if current != written {
+        return Err(format!("版本已改为 {current}，请检查 package.json"));
+    }
+    write_package_version(path, original).map(|_| ())
+}
+
+fn build_and_package(
+    task: &ReleaseTask<'_>,
+    config: &ReleaseConfig,
+    version: &str,
+    build: &mut Command,
+    dir: &Path,
+) -> Result<String, PipelineError> {
+    task.step("build", "running", None);
+    let output_path = validate_output_dir(&config.output_dir).map_err(|e| ("build", e))?;
+    let before = snapshot(dir, output_path).map_err(|e| ("build", e))?;
+    task.run(
+        build,
+        &format!("{} run {}", task.project.package_manager, config.script),
+    )
+    .map_err(|e| ("build", e))?;
+    task.step("build", "success", None);
+
+    task.step("zip", "running", None);
+    let output = dir.join(output_path);
+    let after = snapshot(dir, output_path).map_err(|e| ("zip", e))?;
+    let artifacts = select_artifacts(&output, &before, after, version).map_err(|e| ("zip", e))?;
+    let stem = format!(
+        "{}_v{}_{}",
+        sanitize_filename(&task.project.name),
+        version,
+        today_compact()
+    );
+    let zip_path = unique_zip_path(&output, stem);
+    let stats = write_archive(&artifacts, &zip_path, ZIP_LEVEL).map_err(|e| ("zip", e))?;
+    task.log(&format!(
+        "压缩完成：{} 个文件，{} → {}（{}），产物根目录 {}",
+        stats.files,
+        human_size(stats.raw_bytes),
+        human_size(stats.packed_bytes),
+        ratio(stats.raw_bytes, stats.packed_bytes),
+        artifacts.root.display(),
+    ));
+    task.step(
+        "zip",
+        "success",
+        Some(format!(
+            "{}（{}）",
+            zip_path.display(),
+            human_size(stats.packed_bytes)
         )),
-        Err(e) => Err(format!("等待 `{command}` 退出失败: {e}")),
-    }
+    );
+    Ok(zip_path.to_string_lossy().into_owned())
 }
 
 /// 同步执行并捕获输出（预检 / 读 node 版本这类一次性命令，输出不进日志抽屉）。
@@ -547,19 +545,6 @@ fn read_package_version_at(pkg_path: &Path) -> Result<String, String> {
 /// 当前分支。用 `git rev-parse` 而不是读 `.git/HEAD`：worktree 下 `.git` 是文件，
 /// 顺着路径找 HEAD 找不到；detached HEAD 时 `--abbrev-ref` 返回字面量 "HEAD"，
 /// 退化为短哈希。
-fn current_git_branch(dir: &Path) -> Option<String> {
-    if let Ok((true, out, _)) = run_capture(dir, "git rev-parse --abbrev-ref HEAD") {
-        let name = out.trim();
-        if !name.is_empty() && name != "HEAD" {
-            return Some(name.to_string());
-        }
-    }
-    match run_capture(dir, "git rev-parse --short HEAD") {
-        Ok((true, out, _)) if !out.trim().is_empty() => Some(out.trim().to_string()),
-        _ => None,
-    }
-}
-
 /// 把 package.json 的 version 改成 new_version。
 /// 用文本替换而不是反序列化写回：保持原文件的缩进、字段顺序等格式不被重排。
 /// 定位时容忍 `"version" : "1.2.3"` 这类冒号两侧的空白，且只替换值本身，
@@ -591,8 +576,7 @@ fn write_package_version(pkg_path: &Path, new_version: &str) -> Result<String, S
                     &content[..i],
                     &content[i + quoted_old.len()..],
                 );
-                std::fs::write(pkg_path, replaced)
-                    .map_err(|e| format!("写回 package.json 失败: {e}"))?;
+                write_package_atomically(pkg_path, replaced.as_bytes())?;
                 return Ok(old);
             }
         }
@@ -602,124 +586,19 @@ fn write_package_version(pkg_path: &Path, new_version: &str) -> Result<String, S
     Err("在 package.json 中找不到 version 字段（格式异常）".into())
 }
 
-fn is_dir_empty(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(true)
-}
-
-/// 一次压缩的统计：写进日志，回答「为什么这个 zip 比手压的大」
-struct ZipStats {
-    /// 实际当作 zip 根的目录
-    root: PathBuf,
-    /// 打进包的文件数（不含目录项）
-    files: u64,
-    /// 打进包的文件原始总字节
-    raw_bytes: u64,
-}
-
-/// 压缩产物 → zip（zip 根 = 产物内容，解压即见 index.html 等）。
-/// dist 的两种形态：
-/// - 版本子目录：dist/dist-<name>-<version>/（vite 按版本输出）→ 取最新子目录为根；
-/// - 扁平：index.html / assets 直接在 dist 下 → 以 dist 为根。
-/// 所有层级的 *.zip（历史产物，含正在生成的这份）不打入包。
-fn zip_dist(dist: &Path, zip_path: &Path, level: i64) -> Result<ZipStats, String> {
-    use std::fs::File;
-    use std::io::Write;
-    use zip::write::SimpleFileOptions;
-    use zip::CompressionMethod;
-
-    let file = File::create(zip_path).map_err(|e| format!("创建 zip 失败: {e}"))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .compression_level(Some(level));
-
-    // 版本子目录形态 → 以最新修改的子目录为 zip 根
-    let root = latest_product_dir(dist).unwrap_or_else(|| dist.to_path_buf());
-    let mut stats = ZipStats {
-        root: root.clone(),
-        files: 0,
-        raw_bytes: 0,
-    };
-    walk(&root, &root, &mut zip, options, &mut stats)?;
-
-    zip.finish()
-        .map_err(|e| format!("完成 zip 失败: {e}"))?
-        .flush()
-        .map_err(|e| format!("写入 zip 失败: {e}"))?;
-    Ok(stats)
-}
-
-/// dist 顶层只有子目录、无散文件时，返回最新修改的子目录（刚构建出来的产物）；
-/// 扁平形态（顶层有散文件）返回 None。
-fn latest_product_dir(dist: &Path) -> Option<PathBuf> {
-    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    let mut has_files = false;
-    for entry in std::fs::read_dir(dist).ok()?.flatten() {
-        let path = entry.path();
-        if is_zip_path(&path) {
-            continue;
-        }
-        if path.is_dir() {
-            let mtime = entry.metadata().ok()?.modified().ok()?;
-            dirs.push((mtime, path));
-        } else {
-            has_files = true;
-        }
+fn write_package_atomically(path: &Path, content: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension("json.fpm-version.tmp");
+    let mut file = std::fs::File::create_new(&temporary)
+        .map_err(|error| format!("创建版本更新临时文件失败: {error}"))?;
+    let written = file.write_all(content).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.and_then(|_| std::fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    if has_files || dirs.is_empty() {
-        return None;
-    }
-    dirs.sort_by_key(|(t, _)| *t);
-    dirs.pop().map(|(_, p)| p)
+    result.map_err(|error| format!("写入 package.json 失败: {error}"))
 }
 
-/// 递归写入 zip。name 一律相对固定的 root 计算——基准随递归层级变化的话，
-/// 不同子目录下的同名文件会算出重复的 zip 条目名（Duplicate filename 报错）。
-fn walk(
-    root: &Path,
-    dir: &Path,
-    zip: &mut zip::ZipWriter<std::fs::File>,
-    options: zip::write::SimpleFileOptions,
-    stats: &mut ZipStats,
-) -> Result<(), String> {
-    use std::fs::File;
-    use std::io::copy;
-
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("读取目录失败: {e}"))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if is_zip_path(&path) {
-            continue;
-        }
-        let name = path
-            .strip_prefix(root)
-            .map_err(|e| format!("计算相对路径失败: {e}"))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if path.is_dir() {
-            zip.add_directory(format!("{name}/"), options)
-                .map_err(|e| format!("写入目录项失败: {e}"))?;
-            walk(root, &path, zip, options, stats)?;
-        } else {
-            stats.files += 1;
-            stats.raw_bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            zip.start_file(name, options)
-                .map_err(|e| format!("写入文件项失败: {e}"))?;
-            let mut src = File::open(&path).map_err(|e| format!("打开文件失败: {e}"))?;
-            copy(&mut src, zip).map_err(|e| format!("压缩失败: {e}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn is_zip_path(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
-}
-
-/// 文件名非法字符替换为 '-'（项目名进 zip 文件名用）
 fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
@@ -758,6 +637,364 @@ fn today_compact() -> String {
     chrono::Local::now().format("%Y%m%d").to_string()
 }
 
+/// `git status --porcelain` 里会拦住发布的路径、已忽略的路径，以及
+/// pnpm-workspace.yaml 是不是「只有 allowBuilds 变了」。
+struct WorkspaceStatus {
+    blocking: Vec<String>,
+    ignored: Vec<String>,
+    allow_builds_ignored: bool,
+    allow_builds_changes: Vec<AllowBuildsChange>,
+}
+
+fn workspace_status(dir: &Path, extra_ignore: &[String]) -> Result<WorkspaceStatus, String> {
+    // -uall：否则未跟踪目录只显示成 `?? apps/`，里面的 .env.development 对不上忽略规则，
+    // 整个目录会被误当成待提交代码。已跟踪文件的改动不受这个开关影响。
+    let (ok, out, err) = run_capture(dir, "git status --porcelain --untracked-files=all")
+        .map_err(|e| format!("无法读取 git 状态: {e}"))?;
+    if !ok {
+        return Err(format!("无法读取 git 状态: {}", err.trim()));
+    }
+
+    let mut blocking = Vec::new();
+    let mut ignored = Vec::new();
+    let mut saw_workspace = false;
+    for path in parse_porcelain_paths(&out) {
+        if path_ignored(&path, extra_ignore) {
+            ignored.push(path);
+            continue;
+        }
+        if path == "pnpm-workspace.yaml" {
+            saw_workspace = true;
+            continue;
+        }
+        blocking.push(path);
+    }
+
+    let (allow_builds_ignored, allow_builds_changes) = if saw_workspace {
+        classify_workspace_file(dir)?
+    } else {
+        (false, Vec::new())
+    };
+    if saw_workspace && allow_builds_ignored {
+        ignored.push("pnpm-workspace.yaml".into());
+    } else if saw_workspace {
+        blocking.push("pnpm-workspace.yaml".into());
+    }
+    blocking.sort();
+    ignored.sort();
+    Ok(WorkspaceStatus {
+        blocking,
+        ignored,
+        allow_builds_ignored,
+        allow_builds_changes,
+    })
+}
+
+fn join_paths(paths: &[String], limit: usize) -> String {
+    let shown: Vec<&str> = paths.iter().take(limit).map(String::as_str).collect();
+    let mut text = shown.join("、");
+    if paths.len() > limit {
+        text.push_str(&format!(" 等 {} 个", paths.len()));
+    }
+    text
+}
+
+/// porcelain v1：`XY PATH`，重命名取箭头右侧。路径含特殊字符时 git 会加引号。
+fn parse_porcelain_paths(out: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in out.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let status = &line[..2];
+        let payload = line[3..].trim_end();
+        let path = if status.contains('R') || status.contains('C') {
+            payload
+                .rsplit_once(" -> ")
+                .map(|(_, new)| new)
+                .unwrap_or(payload)
+        } else {
+            payload
+        };
+        let path = unquote_git(path);
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn unquote_git(s: &str) -> String {
+    let s = s.trim();
+    if s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut chars = s[1..s.len() - 1].chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 内置始终忽略 `.env.development`（任意目录）。额外模式：
+/// 无斜杠 = 文件名或整段路径；带 `*` 的简单 glob（`*` 不跨 `/`，`**` 跨目录）；
+/// 以 `/` 结尾 = 目录前缀；否则整段路径精确匹配。
+fn path_ignored(path: &str, extra: &[String]) -> bool {
+    let path = path.trim_end_matches(['/', '\\']).replace('\\', "/");
+    let name = path.rsplit('/').next().unwrap_or(&path);
+    if name == ".env.development" {
+        return true;
+    }
+    extra.iter().any(|raw| {
+        let pattern = raw.trim().replace('\\', "/");
+        if pattern.is_empty() || pattern_too_broad(&pattern) {
+            return false;
+        }
+        if pattern.contains('*') {
+            glob_match(&pattern, &path) || (!pattern.contains('/') && glob_match(&pattern, name))
+        } else if pattern.ends_with('/') {
+            let prefix = pattern.trim_end_matches('/');
+            path == prefix || path.starts_with(&format!("{prefix}/"))
+        } else if pattern.contains('/') {
+            path == pattern
+        } else {
+            name == pattern || path == pattern
+        }
+    })
+}
+
+/// `*` / `**` 会把所有未提交文件都放行，等于关掉预检，拒绝这种模式。
+fn pattern_too_broad(pattern: &str) -> bool {
+    matches!(pattern, "*" | "**" | "**/*" | "**/**" | "/*" | "/**")
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn rec(p: &[char], t: &[char]) -> bool {
+        let mut i = 0;
+        let mut j = 0;
+        while i < p.len() {
+            if p[i] == '*' && i + 1 < p.len() && p[i + 1] == '*' {
+                let mut k = i + 2;
+                if k < p.len() && p[k] == '/' {
+                    k += 1;
+                }
+                if k == p.len() {
+                    return true;
+                }
+                for t0 in j..=t.len() {
+                    if rec(&p[k..], &t[t0..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if p[i] == '*' {
+                let rest = &p[i + 1..];
+                let end = t[j..]
+                    .iter()
+                    .position(|c| *c == '/')
+                    .map(|n| j + n)
+                    .unwrap_or(t.len());
+                for t0 in j..=end {
+                    if rec(rest, &t[t0..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            if j >= t.len() || p[i] != t[j] {
+                return false;
+            }
+            i += 1;
+            j += 1;
+        }
+        j == t.len()
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    rec(&p, &t)
+}
+
+struct AllowSplit {
+    /// allowBuilds 块以外的文本（换行已规范成 `\n`）
+    rest: String,
+    entries: BTreeMap<String, String>,
+}
+
+/// 把根级 `allowBuilds:` 块从正文里拆出来。块外文本相同 ⇒ 文件没有别的改动。
+fn split_allow_builds(content: &str) -> AllowSplit {
+    let normalized = content.replace("\r\n", "\n");
+    let mut rest_lines: Vec<&str> = Vec::new();
+    let mut entries = BTreeMap::new();
+    let mut in_block = false;
+    for line in normalized.split('\n') {
+        if !in_block {
+            if is_allow_builds_header(line) {
+                in_block = true;
+            } else {
+                rest_lines.push(line);
+            }
+            continue;
+        }
+        if is_root_line(line) {
+            in_block = false;
+            if is_allow_builds_header(line) {
+                continue;
+            }
+            rest_lines.push(line);
+            continue;
+        }
+        match parse_allow_entry(line) {
+            AllowEntry::Skip => {}
+            AllowEntry::Value(k, v) => {
+                entries.insert(k, v);
+            }
+            AllowEntry::Other => rest_lines.push(line),
+        }
+    }
+    AllowSplit {
+        rest: rest_lines.join("\n"),
+        entries,
+    }
+}
+
+fn is_root_line(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+    !trimmed.starts_with(' ') && !trimmed.starts_with('\t')
+}
+
+fn is_allow_builds_header(line: &str) -> bool {
+    root_key_name(line).as_deref() == Some("allowBuilds")
+        && line.split_once(':').is_some_and(|(_, value)| {
+            value.trim().is_empty() || value.trim_start().starts_with('#')
+        })
+}
+
+fn root_key_name(line: &str) -> Option<String> {
+    if !is_root_line(line) {
+        return None;
+    }
+    let t = line.trim();
+    let (name, rest) = if let Some(r) = t.strip_prefix('"').or_else(|| t.strip_prefix('\'')) {
+        let quote = t.chars().next()?;
+        let end = r.find(quote)?;
+        (r[..end].to_string(), r[end + 1..].trim_start().to_string())
+    } else {
+        let idx = t.find(':')?;
+        (
+            t[..idx].trim().to_string(),
+            t[idx..].trim_start().to_string(),
+        )
+    };
+    if rest.starts_with(':') {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+enum AllowEntry {
+    Skip,
+    Value(String, String),
+    Other,
+}
+
+fn parse_allow_entry(line: &str) -> AllowEntry {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return AllowEntry::Skip;
+    }
+    let (key, value) = match split_yaml_kv(t) {
+        Some(pair) => pair,
+        None => return AllowEntry::Other,
+    };
+    AllowEntry::Value(key, value.to_owned())
+}
+
+fn split_yaml_kv(t: &str) -> Option<(String, &str)> {
+    let (name, rest) = if let Some(r) = t.strip_prefix('"').or_else(|| t.strip_prefix('\'')) {
+        let quote = t.chars().next()?;
+        let end = r.find(quote)?;
+        (r[..end].to_string(), r[end + 1..].trim_start())
+    } else {
+        let idx = t.find(':')?;
+        (t[..idx].trim().to_string(), t[idx..].trim_start())
+    };
+    let rest = rest.strip_prefix(':')?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some((name, rest))
+    }
+}
+
+#[derive(Serialize, Clone)]
+pub(crate) struct AllowBuildsChange {
+    package: String,
+    before: Option<String>,
+    after: Option<String>,
+}
+
+fn allow_builds_changes(head: &AllowSplit, working: &AllowSplit) -> Vec<AllowBuildsChange> {
+    let names: std::collections::BTreeSet<_> =
+        head.entries.keys().chain(working.entries.keys()).collect();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let before = head.entries.get(name).cloned();
+            let after = working.entries.get(name).cloned();
+            (before != after).then(|| AllowBuildsChange {
+                package: name.clone(),
+                before,
+                after,
+            })
+        })
+        .collect()
+}
+
+fn classify_workspace_file(dir: &Path) -> Result<(bool, Vec<AllowBuildsChange>), String> {
+    let (ok, root, err) = run_capture(dir, "git rev-parse --show-toplevel")?;
+    if !ok {
+        return Err(format!("读取 Git 根目录失败: {}", err.trim()));
+    }
+    let root = Path::new(root.trim_end());
+    let working = match std::fs::read_to_string(root.join("pnpm-workspace.yaml")) {
+        Ok(content) => content,
+        Err(_) => return Ok((false, Vec::new())),
+    };
+    let (ok, out, _) = run_capture(root, "git show HEAD:pnpm-workspace.yaml")?;
+    let base = if ok { out } else { String::new() };
+    let head = split_allow_builds(&base);
+    let working = split_allow_builds(&working);
+    let (index_exists, index, _) = run_capture(root, "git show :pnpm-workspace.yaml")?;
+    let staged = split_allow_builds(if index_exists { &index } else { "" });
+    let mut changes = allow_builds_changes(&head, &working);
+    if changes.is_empty() {
+        changes = allow_builds_changes(&head, &staged);
+    }
+    let other_changes =
+        head.rest.trim() != working.rest.trim() || head.rest.trim() != staged.rest.trim();
+    Ok((!other_changes && !changes.is_empty(), changes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,7 +1028,10 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_illegal_chars() {
-        assert_eq!(sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"), "a-b-c-d-e-f-g-h-i-j");
+        assert_eq!(
+            sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"),
+            "a-b-c-d-e-f-g-h-i-j"
+        );
     }
 
     /// 冒号两侧带空白的 format 也能定位并替换，且只动值、保留原格式
@@ -884,7 +1124,10 @@ mod tests {
     #[test]
     fn release_context_reads_base_from_release_branch() {
         // 需要 git；环境里没有就跳过（这条流水线本身也依赖 git）
-        if !matches!(run_capture(Path::new("."), "git --version"), Ok((true, _, _))) {
+        if !matches!(
+            run_capture(Path::new("."), "git --version"),
+            Ok((true, _, _))
+        ) {
             return;
         }
         let base = std::env::temp_dir().join(format!(
@@ -914,7 +1157,7 @@ mod tests {
         git("commit -q -m bump-on-feature");
 
         let path = repo.to_string_lossy().to_string();
-        let ctx = read_release_context(path.clone(), "master".to_string()).unwrap();
+        let ctx = read_release_context(path.clone(), "master".to_string(), None).unwrap();
         assert_eq!(ctx.release_version, "1.4.0", "基准应取发布分支的已提交版本");
         assert_eq!(ctx.release_ref, "master");
         assert_eq!(ctx.current_branch.as_deref(), Some("feature"));
@@ -923,7 +1166,7 @@ mod tests {
 
         // 工作区脏（上次发布后版本号没提交）也能读出来，供弹窗提示
         fs::write(repo.join("package.json"), "{\"version\": \"2.1.1\"}").unwrap();
-        let ctx = read_release_context(path, "master".to_string()).unwrap();
+        let ctx = read_release_context(path, "master".to_string(), None).unwrap();
         assert_eq!(ctx.release_version, "1.4.0", "脏工作区不影响基准");
         assert_eq!(ctx.working_version.as_deref(), Some("2.1.1"));
         assert!(ctx.dirty);
@@ -967,7 +1210,12 @@ mod tests {
         fs::write(dist.join("old_v1.0.0_20260101.zip"), "old").unwrap();
 
         let zip_path = dist.join("demo_v1.0.1_20260911.zip");
-        zip_dist(&dist, &zip_path, ZIP_LEVEL).unwrap();
+        let project = dist.parent().unwrap();
+        let before = snapshot(project, Path::new("dist")).unwrap();
+        fs::write(product.join("index.html"), "new build contents").unwrap();
+        let after = snapshot(project, Path::new("dist")).unwrap();
+        let artifacts = select_artifacts(&dist, &before, after, "1.0.0").unwrap();
+        write_archive(&artifacts, &zip_path, ZIP_LEVEL).unwrap();
 
         let f = fs::File::open(&zip_path).unwrap();
         let archive = zip::ZipArchive::new(f).unwrap();
@@ -1004,13 +1252,135 @@ mod tests {
         fs::write(dist.join("assets/app.js"), "console.log(1)").unwrap();
 
         let zip_path = dist.join("demo_v2.0.0_20260911.zip");
-        zip_dist(&dist, &zip_path, ZIP_LEVEL).unwrap();
+        let after = snapshot(dist.parent().unwrap(), Path::new("dist")).unwrap();
+        let empty = snapshot(dist.parent().unwrap(), Path::new("does-not-exist")).unwrap();
+        let artifacts = select_artifacts(&dist, &empty, after, "1.0.0").unwrap();
+        write_archive(&artifacts, &zip_path, ZIP_LEVEL).unwrap();
 
         let f = fs::File::open(&zip_path).unwrap();
         let archive = zip::ZipArchive::new(f).unwrap();
         let mut names: Vec<String> = archive.file_names().map(str::to_string).collect();
         names.sort();
         assert_eq!(names, vec!["assets/", "assets/app.js", "index.html"]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ignore_matches_env_development_and_user_patterns() {
+        assert!(path_ignored(".env.development", &[]));
+        assert!(path_ignored("apps/web/.env.development", &[]));
+        assert!(!path_ignored(".env.local", &[]));
+        assert!(path_ignored(".env.local", &[".env.local".to_string()]));
+        assert!(path_ignored(
+            "packages/app/.env.local",
+            &["*.local".to_string()]
+        ));
+        assert!(path_ignored(
+            "coverage/lcov.info",
+            &["coverage/".to_string()]
+        ));
+        assert!(!path_ignored("src/main.ts", &["*.local".to_string()]));
+        // 过宽的模式等于关掉预检，不当忽略
+        assert!(!path_ignored("src/main.ts", &["**".to_string()]));
+        assert!(!path_ignored("src/main.ts", &["*".to_string()]));
+    }
+
+    #[test]
+    fn porcelain_parser_takes_rename_destination_and_unquotes() {
+        let out = " M src/a.ts\n?? .env.development\nR  \"old file.ts\" -> \"new file.ts\"\n";
+        assert_eq!(
+            parse_porcelain_paths(out),
+            vec![
+                "src/a.ts".to_string(),
+                ".env.development".to_string(),
+                "new file.ts".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_builds_diff_tracks_add_remove_and_unresolved_values() {
+        let head = split_allow_builds(
+            "packages:\n  - apps/*\nallowBuilds:\n  esbuild: false\n  removed: true\n",
+        );
+        let working = split_allow_builds("packages:\n  - apps/*\nallowBuilds:\n  esbuild: true\n  added: set this to true or false\n");
+        assert_eq!(head.rest, working.rest);
+        let changes = allow_builds_changes(&head, &working);
+        assert!(changes.iter().any(|entry| entry.package == "esbuild"
+            && entry.before.as_deref() == Some("false")
+            && entry.after.as_deref() == Some("true")));
+        assert!(changes
+            .iter()
+            .any(|entry| entry.package == "removed" && entry.after.is_none()));
+        assert!(changes.iter().any(|entry| entry.package == "added"
+            && entry.after.as_deref() == Some("set this to true or false")));
+    }
+
+    #[test]
+    fn workspace_status_ignores_env_and_allow_builds() {
+        if !matches!(
+            run_capture(Path::new("."), "git --version"),
+            Ok((true, _, _))
+        ) {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "fpm-ws-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let git = |cmd: &str| {
+            let full = format!("git -c user.email=t@t -c user.name=t {cmd}");
+            let (ok, _, err) = run_capture(&repo, &full).unwrap();
+            assert!(ok, "`{full}` 失败: {}", err.trim());
+        };
+        git("init -q");
+        fs::write(repo.join("package.json"), "{\"version\": \"1.0.0\"}").unwrap();
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n",
+        )
+        .unwrap();
+        git("add -A");
+        git("commit -q -m init");
+
+        fs::write(repo.join(".env.development"), "VITE_X=1\n").unwrap();
+        fs::create_dir_all(repo.join("apps")).unwrap();
+        fs::write(repo.join("apps/.env.development"), "VITE_Y=1\n").unwrap();
+        fs::write(
+            repo.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\nallowBuilds:\n  esbuild: true\n  '@parcel/watcher': true\n  vue-demi: true\n",
+        )
+        .unwrap();
+
+        let ws = workspace_status(&repo, &[]).unwrap();
+        assert!(ws.blocking.is_empty(), "blocking = {:?}", ws.blocking);
+        assert!(ws.ignored.iter().any(|p| p == ".env.development"));
+        assert!(ws.ignored.iter().any(|p| p.ends_with(".env.development")));
+        assert!(ws.allow_builds_ignored);
+        assert_eq!(ws.allow_builds_changes.len(), 3);
+
+        git("add pnpm-workspace.yaml");
+        let (_, before, _) =
+            run_capture(&repo, "git diff --cached -- pnpm-workspace.yaml").unwrap();
+        let _ = workspace_status(&repo, &[]).unwrap();
+        let (_, after, _) = run_capture(&repo, "git diff --cached -- pnpm-workspace.yaml").unwrap();
+        assert!(!before.is_empty());
+        assert_eq!(before, after);
+        assert!(fs::read_to_string(repo.join("pnpm-workspace.yaml"))
+            .unwrap()
+            .contains("esbuild: true"));
+
+        // 真正的源码改动仍然拦住，忽略项继续不算
+        fs::write(repo.join("package.json"), "{\"version\": \"1.0.1\"}").unwrap();
+        let ws = workspace_status(&repo, &[]).unwrap();
+        assert_eq!(ws.blocking, vec!["package.json".to_string()]);
+        assert!(ws.allow_builds_ignored);
+
         let _ = fs::remove_dir_all(&base);
     }
 }

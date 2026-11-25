@@ -42,6 +42,16 @@ pub struct ReleaseConfig {
     pub node_version: String,
     /// 构建脚本名（如 "build:prod"）
     pub script: String,
+    /// 预检额外忽略的路径。`.env.development` 始终忽略，不必写在这里。
+    /// 旧的 projects.json 没有这个字段，缺省为空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_paths: Vec<String>,
+    #[serde(default = "default_output_dir")]
+    pub output_dir: String,
+}
+
+fn default_output_dir() -> String {
+    "dist".into()
 }
 
 fn projects_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -65,16 +75,25 @@ pub fn load_projects(app: tauri::AppHandle) -> Result<Vec<Project>, String> {
 #[tauri::command]
 pub fn save_projects(app: tauri::AppHandle, projects: Vec<Project>) -> Result<(), String> {
     let file = projects_file(&app)?;
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建数据目录失败: {e}"))?;
+    let json =
+        serde_json::to_vec_pretty(&projects).map_err(|e| format!("序列化项目列表失败: {e}"))?;
+    save_local_file(&file, &json).map_err(|e| format!("保存 projects.json 失败: {e}"))
+}
+
+pub(crate) fn save_local_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(&projects)
-        .map_err(|e| format!("序列化项目列表失败: {e}"))?;
-    // 先写临时文件再原子替换，避免写一半崩溃损坏数据
-    let tmp = file.with_extension("json.tmp");
-    fs::write(&tmp, &json).map_err(|e| format!("写入失败: {e}"))?;
-    fs::rename(&tmp, &file).map_err(|e| format!("替换 projects.json 失败: {e}"))?;
-    Ok(())
+    let temporary = path.with_extension("json.tmp");
+    let mut file = fs::File::create(&temporary)?;
+    let written = file.write_all(data).and_then(|_| file.sync_all());
+    drop(file);
+    let result = written.and_then(|_| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// 选定文件夹后的自动识别结果
@@ -114,17 +133,7 @@ pub fn inspect_project(path: String) -> Result<ProjectInspection, String> {
                 .unwrap_or_else(|| "未命名项目".into())
         });
 
-    // 包管理器：按锁文件推断
-    let package_manager = if dir.join("pnpm-lock.yaml").exists() {
-        "pnpm"
-    } else if dir.join("yarn.lock").exists() {
-        "yarn"
-    } else if dir.join("bun.lockb").exists() || dir.join("bun.lock").exists() {
-        "bun"
-    } else {
-        "npm"
-    }
-    .to_string();
+    let package_manager = crate::diagnostics::package_manager_for(dir, &pkg);
 
     // 启动脚本：优先 dev，其次 start
     let has_script = |key: &str| {
@@ -171,27 +180,14 @@ pub fn inspect_project(path: String) -> Result<ProjectInspection, String> {
 
 #[tauri::command]
 pub fn read_git_branch(path: String) -> Result<Option<String>, String> {
-    let head = Path::new(&path).join(".git").join("HEAD");
-    if !head.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(&head).map_err(|e| format!("读取 .git/HEAD 失败: {e}"))?;
-    let content = content.trim();
-    if let Some(branch) = content.strip_prefix("ref: refs/heads/") {
-        Ok(Some(branch.to_string()))
-    } else if content.len() >= 7 && content.chars().all(|c| c.is_ascii_hexdigit()) {
-        // detached HEAD：显示短哈希
-        Ok(Some(content[..7].to_string()))
-    } else {
-        Ok(None)
-    }
+    crate::diagnostics::git_head(Path::new(&path))
 }
 
 /// 依赖预检（FR-11）：node_modules 是否已安装。
 /// 返回 bool 而非 Result：目录不存在/读不了都视为「未安装」，让用户走 install 流程。
 #[tauri::command]
 pub fn check_deps(path: String) -> bool {
-    Path::new(&path).join("node_modules").is_dir()
+    crate::diagnostics::dependencies_available(Path::new(&path))
 }
 
 /// 读取项目落盘日志的尾部（FR-10 跨会话日志：项目未运行时展示上次会话的尾部日志）
@@ -213,13 +209,16 @@ pub fn read_log_tail(
 
 /// 从文件尾部读取最多 max_lines 行。只回看固定 256KB，避免大文件全量读入内存；
 /// 若从文件中间起读，首行可能是不完整的半行，直接丢弃。
-fn read_log_tail_from(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
+pub(crate) fn read_log_tail_from(path: &Path, max_lines: usize) -> Result<Vec<String>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
     const LOOKBACK_BYTES: u64 = 256 * 1024;
 
     let mut file = fs::File::open(path).map_err(|e| format!("读取日志失败: {e}"))?;
-    let len = file.metadata().map_err(|e| format!("读取日志元数据失败: {e}"))?.len();
+    let len = file
+        .metadata()
+        .map_err(|e| format!("读取日志元数据失败: {e}"))?
+        .len();
     let start = len.saturating_sub(LOOKBACK_BYTES);
     file.seek(SeekFrom::Start(start))
         .map_err(|e| format!("定位日志读取位置失败: {e}"))?;
@@ -312,7 +311,10 @@ pub fn scan_projects(root: String) -> Result<Vec<ScannedProject>, String> {
         }
         let path_str = path.to_string_lossy().to_string();
         if let Ok(inspection) = inspect_project(path_str.clone()) {
-            found.push(ScannedProject { path: path_str, inspection });
+            found.push(ScannedProject {
+                path: path_str,
+                inspection,
+            });
         }
     }
     // 排序让列表稳定
