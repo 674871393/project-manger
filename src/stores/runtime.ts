@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import type { Project, ReleaseAnnouncement, RunStatus } from "@/types";
 import { useProjectsStore } from "@/stores/projects";
-import { parseDevelopmentAddress, portAddress, stripAnsi, type AddressCandidate } from "@/lib/project-address";
+import { isDevToolsPath, parseDevelopmentAddress, portAddress, stripAnsi, type AddressCandidate } from "@/lib/project-address";
 
 /** 单条日志（stdout/stderr 合并流，保留来源用于着色） */
 export interface LogLine {
@@ -88,7 +88,8 @@ function setRuntime(projectId: string, runtime: ProjectRuntime) {
 
 function readCachedAddress(runId: string): AddressCandidate | undefined {
   try {
-    return JSON.parse(sessionStorage.getItem(addressCachePrefix + runId) ?? "null") ?? undefined;
+    const cached: AddressCandidate | null = JSON.parse(sessionStorage.getItem(addressCachePrefix + runId) ?? "null");
+    if (cached && !isDevToolsPath(new URL(cached.url).pathname)) return cached;
   } catch {
     return undefined;
   }

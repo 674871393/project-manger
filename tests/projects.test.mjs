@@ -123,3 +123,40 @@ test("仅凭本次开发进程的日志确认服务，忽略退出后返回的�
   assert.equal(state().status, "ready");
   assert.equal(state().url, "https://localhost:5173/admin/");
 });
+
+test("Vue DevTools 日志和旧缓存都不会成为项目入口", async () => {
+  const target = project("vite-with-devtools");
+  const runId = "vite-resumed-with-old-cache";
+  activeRuns[target.id] = { runId, pid: 10 };
+  storage.set("fpm:address:" + runId, JSON.stringify({
+    url: "http://localhost:3333/__devtools__/", host: "localhost", port: 3333, priority: 2,
+  }));
+  let calls = 0;
+  probe = async () => { calls++; return true; };
+  await runtime.syncFromBackend();
+  const state = () => useRuntimeStore.getState().runtimes[target.id];
+  assert.equal(calls, 0);
+  const writeLog = (line) => emit("log-line", { projectId: target.id, runId, stream: "stdout", kind: "run", line });
+  writeLog("➜  Vue DevTools: Open http://localhost:3333/__devtools__/ as a separate window");
+  writeLog("http://localhost:3333/__vue-devtools__/?open=1");
+  assert.equal(calls, 0);
+  writeLog("➜  Local:   http://localhost:3333/");
+  await nextTurn();
+  assert.equal(state().status, "ready");
+  assert.equal(state().url, "http://localhost:3333/");
+  assert.equal(calls, 1);
+});
+
+test("框架明确输出的 Local 地址优先于同端口的普通日志地址", async () => {
+  const target = project("vite-base-path");
+  assert.equal(await runtime.start(target), "started");
+  const state = () => useRuntimeStore.getState().runtimes[target.id];
+  const writeLog = (line) => emit("log-line", { projectId: target.id, runId: state().runId, stream: "stdout", kind: "run", line });
+  probe = async () => true;
+  writeLog("http://localhost:3333/");
+  await nextTurn();
+  assert.equal(state().url, "http://localhost:3333/");
+  writeLog("➜  Local:   https://localhost:3333/admin/");
+  await nextTurn();
+  assert.equal(state().url, "https://localhost:3333/admin/");
+});
